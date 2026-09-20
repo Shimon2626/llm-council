@@ -1,40 +1,68 @@
 """3-stage LLM Council orchestration."""
 
-from typing import List, Dict, Any, Tuple
-from .openrouter import query_models_parallel, query_model
-from .config import COUNCIL_MODELS, CHAIRMAN_MODEL
+from typing import List, Dict, Any, Optional, Tuple
+from .openrouter import query_models_parallel, query_model, CHAIRMAN_MAX_TOKENS
+from .config import COUNCIL_MODELS, CHAIRMAN_MODEL, enrich_model_spec, enrich_council_models
+from . import pricing
 
 
-async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
+async def stage1_collect_responses(
+    user_query: str,
+    council_models: Optional[List[Dict[str, str]]] = None,
+    council_max_tokens: Optional[int] = None,
+    cost_log: Optional[List[Dict[str, Any]]] = None
+) -> List[Dict[str, Any]]:
     """
     Stage 1: Collect individual responses from all council models.
 
     Args:
         user_query: The user's question
+        council_models: optional per-request override of which seats to query
+            (each a single-provider spec, e.g. {"nvidia": "..."}); defaults
+            to config.COUNCIL_MODELS
+        council_max_tokens: optional per-request completion cap override for
+            every seat; defaults to DEFAULT_MAX_TOKENS if None
+        cost_log: optional list this stage appends real per-response token
+            usage to (see pricing.compute_actual_cost). None means "don't
+            bother" — callers that don't need actual cost just omit it.
 
     Returns:
         List of dicts with 'model' and 'response' keys
     """
     messages = [{"role": "user", "content": user_query}]
 
-    # Query all models in parallel
-    responses = await query_models_parallel(COUNCIL_MODELS, messages)
+    # Query all models in parallel. Each explicitly-picked seat gets its
+    # verified cross-provider equivalent backfilled (enrich_model_spec) so a
+    # single-provider pick still fails over on error, same as the default
+    # council's dual-provider entries.
+    effective_models = enrich_council_models(council_models) if council_models else COUNCIL_MODELS
+    responses = await query_models_parallel(effective_models, messages, max_tokens=council_max_tokens)
 
     # Format results
     stage1_results = []
-    for model, response in responses.items():
+    for seat_label, response in responses.items():
         if response is not None:  # Only include successful responses
             stage1_results.append({
-                "model": model,
+                "model": f"{response['provider']}/{response['model']}",
                 "response": response.get('content', '')
             })
+            if cost_log is not None:
+                usage = response.get('usage') or {}
+                cost_log.append({
+                    "stage": 1, "provider": response['provider'], "model": response['model'],
+                    "prompt_tokens": usage.get('prompt_tokens', 0),
+                    "completion_tokens": usage.get('completion_tokens', 0),
+                })
 
     return stage1_results
 
 
 async def stage2_collect_rankings(
     user_query: str,
-    stage1_results: List[Dict[str, Any]]
+    stage1_results: List[Dict[str, Any]],
+    council_models: Optional[List[Dict[str, str]]] = None,
+    council_max_tokens: Optional[int] = None,
+    cost_log: Optional[List[Dict[str, Any]]] = None
 ) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
     """
     Stage 2: Each model ranks the anonymized responses.
@@ -42,6 +70,11 @@ async def stage2_collect_rankings(
     Args:
         user_query: The original user query
         stage1_results: Results from Stage 1
+        council_models: optional per-request override, same seats used in stage 1
+        council_max_tokens: optional per-request completion cap override,
+            same value used in stage 1
+        cost_log: optional list this stage appends real per-response token
+            usage to, same list passed to stage 1 (see pricing.compute_actual_cost)
 
     Returns:
         Tuple of (rankings list, label_to_model mapping)
@@ -94,20 +127,28 @@ Now provide your evaluation and ranking:"""
 
     messages = [{"role": "user", "content": ranking_prompt}]
 
-    # Get rankings from all council models in parallel
-    responses = await query_models_parallel(COUNCIL_MODELS, messages)
+    # Get rankings from all council models in parallel (same fallback backfill as stage 1)
+    effective_models = enrich_council_models(council_models) if council_models else COUNCIL_MODELS
+    responses = await query_models_parallel(effective_models, messages, max_tokens=council_max_tokens)
 
     # Format results
     stage2_results = []
-    for model, response in responses.items():
+    for seat_label, response in responses.items():
         if response is not None:
             full_text = response.get('content', '')
             parsed = parse_ranking_from_text(full_text)
             stage2_results.append({
-                "model": model,
+                "model": f"{response['provider']}/{response['model']}",
                 "ranking": full_text,
                 "parsed_ranking": parsed
             })
+            if cost_log is not None:
+                usage = response.get('usage') or {}
+                cost_log.append({
+                    "stage": 2, "provider": response['provider'], "model": response['model'],
+                    "prompt_tokens": usage.get('prompt_tokens', 0),
+                    "completion_tokens": usage.get('completion_tokens', 0),
+                })
 
     return stage2_results, label_to_model
 
@@ -115,7 +156,10 @@ Now provide your evaluation and ranking:"""
 async def stage3_synthesize_final(
     user_query: str,
     stage1_results: List[Dict[str, Any]],
-    stage2_results: List[Dict[str, Any]]
+    stage2_results: List[Dict[str, Any]],
+    chairman_model: Optional[Dict[str, str]] = None,
+    chairman_max_tokens: Optional[int] = None,
+    cost_log: Optional[List[Dict[str, Any]]] = None
 ) -> Dict[str, Any]:
     """
     Stage 3: Chairman synthesizes final response.
@@ -124,6 +168,11 @@ async def stage3_synthesize_final(
         user_query: The original user query
         stage1_results: Individual model responses from Stage 1
         stage2_results: Rankings from Stage 2
+        chairman_model: optional per-request override; defaults to config.CHAIRMAN_MODEL
+        chairman_max_tokens: optional per-request completion cap override;
+            defaults to CHAIRMAN_MAX_TOKENS if None
+        cost_log: optional list this stage appends real token usage to, same
+            list passed to stages 1/2 (see pricing.compute_actual_cost)
 
     Returns:
         Dict with 'model' and 'response' keys
@@ -158,18 +207,31 @@ Provide a clear, well-reasoned final answer that represents the council's collec
 
     messages = [{"role": "user", "content": chairman_prompt}]
 
-    # Query the chairman model
-    response = await query_model(CHAIRMAN_MODEL, messages)
+    # Query the chairman model — larger token budget since it synthesizes
+    # every stage1/stage2 response into one answer (see CHAIRMAN_MAX_TOKENS).
+    # Same fallback backfill as the council seats: an explicit single-provider
+    # chairman pick still fails over to its verified equivalent on error.
+    effective_chairman_max_tokens = chairman_max_tokens if chairman_max_tokens is not None else CHAIRMAN_MAX_TOKENS
+    effective_chairman = enrich_model_spec(chairman_model) if chairman_model else CHAIRMAN_MODEL
+    response = await query_model(effective_chairman, messages, max_tokens=effective_chairman_max_tokens)
 
     if response is None:
         # Fallback if chairman fails
         return {
-            "model": CHAIRMAN_MODEL,
+            "model": "error",
             "response": "Error: Unable to generate final synthesis."
         }
 
+    if cost_log is not None:
+        usage = response.get('usage') or {}
+        cost_log.append({
+            "stage": 3, "provider": response['provider'], "model": response['model'],
+            "prompt_tokens": usage.get('prompt_tokens', 0),
+            "completion_tokens": usage.get('completion_tokens', 0),
+        })
+
     return {
-        "model": CHAIRMAN_MODEL,
+        "model": f"{response['provider']}/{response['model']}",
         "response": response.get('content', '')
     }
 
@@ -293,18 +355,32 @@ Title:"""
     return title
 
 
-async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
+async def run_full_council(
+    user_query: str,
+    council_models: Optional[List[Dict[str, str]]] = None,
+    chairman_model: Optional[Dict[str, str]] = None,
+    council_max_tokens: Optional[int] = None,
+    chairman_max_tokens: Optional[int] = None
+) -> Tuple[List, List, Dict, Dict]:
     """
     Run the complete 3-stage council process.
 
     Args:
         user_query: The user's question
+        council_models: optional per-request override of council seats
+        chairman_model: optional per-request override of the Chairman
+        council_max_tokens: optional per-request completion cap for stage 1/2 seats
+        chairman_max_tokens: optional per-request completion cap for the Chairman
 
     Returns:
-        Tuple of (stage1_results, stage2_results, stage3_result, metadata)
+        Tuple of (stage1_results, stage2_results, stage3_result, metadata).
+        metadata includes "actual_cost" — the real cost of this run computed
+        from each response's real token usage, not the pre-run estimate.
     """
+    cost_log = []
+
     # Stage 1: Collect individual responses
-    stage1_results = await stage1_collect_responses(user_query)
+    stage1_results = await stage1_collect_responses(user_query, council_models, council_max_tokens, cost_log)
 
     # If no models responded successfully, return error
     if not stage1_results:
@@ -314,7 +390,7 @@ async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
         }, {}
 
     # Stage 2: Collect rankings
-    stage2_results, label_to_model = await stage2_collect_rankings(user_query, stage1_results)
+    stage2_results, label_to_model = await stage2_collect_rankings(user_query, stage1_results, council_models, council_max_tokens, cost_log)
 
     # Calculate aggregate rankings
     aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
@@ -323,13 +399,17 @@ async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
     stage3_result = await stage3_synthesize_final(
         user_query,
         stage1_results,
-        stage2_results
+        stage2_results,
+        chairman_model,
+        chairman_max_tokens,
+        cost_log
     )
 
     # Prepare metadata
     metadata = {
         "label_to_model": label_to_model,
-        "aggregate_rankings": aggregate_rankings
+        "aggregate_rankings": aggregate_rankings,
+        "actual_cost": await pricing.compute_actual_cost(cost_log)
     }
 
     return stage1_results, stage2_results, stage3_result, metadata

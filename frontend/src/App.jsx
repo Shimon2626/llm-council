@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import Sidebar from './components/Sidebar';
 import ChatInterface from './components/ChatInterface';
 import { api } from './api';
@@ -9,6 +9,10 @@ function App() {
   const [currentConversationId, setCurrentConversationId] = useState(null);
   const [currentConversation, setCurrentConversation] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
+  // Lets handleStopMessage cancel the in-flight fetch from a Stop button —
+  // aborting client-side also makes the backend's request.is_disconnected()
+  // check true, so it stops paying for further council API calls too.
+  const abortControllerRef = useRef(null);
 
   // Load conversations on mount
   useEffect(() => {
@@ -57,8 +61,11 @@ function App() {
     setCurrentConversationId(id);
   };
 
-  const handleSendMessage = async (content) => {
+  const handleSendMessage = async (content, councilModels, chairmanModel, councilMaxTokens, chairmanMaxTokens) => {
     if (!currentConversationId) return;
+
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
 
     setIsLoading(true);
     try {
@@ -150,6 +157,15 @@ function App() {
             });
             break;
 
+          case 'cost_complete':
+            setCurrentConversation((prev) => {
+              const messages = [...prev.messages];
+              const lastMsg = messages[messages.length - 1];
+              lastMsg.actual_cost = event.data;
+              return { ...prev, messages };
+            });
+            break;
+
           case 'title_complete':
             // Reload conversations to get updated title
             loadConversations();
@@ -169,16 +185,31 @@ function App() {
           default:
             console.log('Unknown event type:', eventType);
         }
-      });
+      }, councilModels, chairmanModel, councilMaxTokens, chairmanMaxTokens, controller.signal);
     } catch (error) {
-      console.error('Failed to send message:', error);
-      // Remove optimistic messages on error
-      setCurrentConversation((prev) => ({
-        ...prev,
-        messages: prev.messages.slice(0, -2),
-      }));
+      const wasStopped = error.name === 'AbortError';
+      if (!wasStopped) console.error('Failed to send message:', error);
+      // Keep whatever partial stage data already streamed in — a dropped
+      // connection mid-run used to wipe both the user's message and the
+      // partial assistant reply, which is what made this look like the
+      // page "disconnected" on every long-running council request.
+      setCurrentConversation((prev) => {
+        const messages = [...prev.messages];
+        const lastMsg = messages[messages.length - 1];
+        if (lastMsg && lastMsg.role === 'assistant') {
+          lastMsg.error = wasStopped
+            ? 'Stopped.'
+            : (error.message || 'Connection lost — please try again.');
+          lastMsg.loading = { stage1: false, stage2: false, stage3: false };
+        }
+        return { ...prev, messages };
+      });
       setIsLoading(false);
     }
+  };
+
+  const handleStopMessage = () => {
+    abortControllerRef.current?.abort();
   };
 
   return (
@@ -192,6 +223,7 @@ function App() {
       <ChatInterface
         conversation={currentConversation}
         onSendMessage={handleSendMessage}
+        onStopMessage={handleStopMessage}
         isLoading={isLoading}
       />
     </div>

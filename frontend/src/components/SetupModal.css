@@ -1,0 +1,171 @@
+.setup-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.setup-modal {
+  background: #fff;
+  border-radius: 8px;
+  width: 440px;
+  max-width: 90vw;
+  padding: 20px 24px 24px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.2);
+}
+
+.setup-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.setup-modal-header h2 {
+  margin: 0;
+  font-size: 18px;
+  color: #333;
+}
+
+.setup-modal-close {
+  background: none;
+  border: none;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  color: #999;
+  padding: 0 4px;
+}
+
+.setup-modal-close:hover {
+  color: #333;
+}
+
+.setup-modal-intro {
+  font-size: 13px;
+  color: #666;
+  line-height: 1.5;
+  margin: 0 0 16px 0;
+}
+
+.setup-modal-intro code {
+  background: #f0f0f0;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 12px;
+}
+
+.setup-key-row {
+  margin-bottom: 16px;
+}
+
+.setup-key-row label {
+  display: block;
+  font-size: 13px;
+  font-weight: 500;
+  color: #333;
+  margin-bottom: 6px;
+}
+
+.setup-status-badge {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 10px;
+  text-transform: uppercase;
+}
+
+.setup-status-badge.configured {
+  background: #e6f4ea;
+  color: #1e7e34;
+}
+
+.setup-status-badge.not-configured {
+  background: #fdecea;
+  color: #c0392b;
+}
+
+.setup-key-row input {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  font-size: 14px;
+  box-sizing: border-box;
+  margin-bottom: 4px;
+}
+
+.setup-key-row input:focus {
+  outline: none;
+  border-color: #4a90e2;
+}
+
+.setup-key-row a {
+  font-size: 12px;
+  color: #4a90e2;
+  text-decoration: none;
+}
+
+.setup-key-row a:hover {
+  text-decoration: underline;
+}
+
+.setup-message {
+  font-size: 13px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  margin-bottom: 12px;
+}
+
+.setup-message.success {
+  background: #e6f4ea;
+  color: #1e7e34;
+}
+
+.setup-message.error {
+  background: #fdecea;
+  color: #c0392b;
+}
+
+.setup-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.setup-cancel-btn {
+  padding: 8px 14px;
+  background: #fff;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  color: #333;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.setup-cancel-btn:hover {
+  background: #f5f5f5;
+}
+
+.setup-save-btn {
+  padding: 8px 16px;
+  background: #4a90e2;
+  border: 1px solid #4a90e2;
+  border-radius: 6px;
+  color: #fff;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.setup-save-btn:hover:not(:disabled) {
+  background: #357abd;
+}
+
+.setup-save-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
