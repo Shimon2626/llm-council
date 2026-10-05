@@ -1,7 +1,7 @@
 """3-stage LLM Council orchestration."""
 
 from typing import List, Dict, Any, Optional, Tuple
-from .openrouter import query_models_parallel, query_model, CHAIRMAN_MAX_TOKENS
+from .openrouter import query_models_parallel, query_model, is_empty, CHAIRMAN_MAX_TOKENS
 from .config import COUNCIL_MODELS, CHAIRMAN_MODEL, enrich_model_spec, enrich_council_models
 from . import pricing
 
@@ -38,21 +38,34 @@ async def stage1_collect_responses(
     effective_models = enrich_council_models(council_models) if council_models else COUNCIL_MODELS
     responses = await query_models_parallel(effective_models, messages, max_tokens=council_max_tokens)
 
-    # Format results
+    # Format results. EVERY seat gets a row, including failures: a seat that
+    # returned nothing used to vanish (None) or pass as an empty "success",
+    # which hid it from the report and let it be ranked as if it had answered.
     stage1_results = []
     for seat_label, response in responses.items():
-        if response is not None:  # Only include successful responses
+        if response is None:
             stage1_results.append({
-                "model": f"{response['provider']}/{response['model']}",
-                "response": response.get('content', '')
+                "model": seat_label, "response": "", "status": "error",
+                "finish_reason": None, "completion_tokens": 0, "reasoning_tokens": 0,
             })
-            if cost_log is not None:
-                usage = response.get('usage') or {}
-                cost_log.append({
-                    "stage": 1, "provider": response['provider'], "model": response['model'],
-                    "prompt_tokens": usage.get('prompt_tokens', 0),
-                    "completion_tokens": usage.get('completion_tokens', 0),
-                })
+            continue
+        usage = response.get('usage') or {}
+        status = "empty" if response.get('empty') else "truncated" if response.get('truncated') else "ok"
+        stage1_results.append({
+            "model": f"{response['provider']}/{response['model']}",
+            "response": response.get('content') or '',
+            "status": status,
+            "finish_reason": response.get('finish_reason'),
+            "completion_tokens": usage.get('completion_tokens', 0),
+            "reasoning_tokens": usage.get('reasoning_tokens', 0),
+            "attempts": response.get('attempts', 1),
+        })
+        if cost_log is not None:
+            cost_log.append({
+                "stage": 1, "provider": response['provider'], "model": response['model'],
+                "prompt_tokens": usage.get('prompt_tokens', 0),
+                "completion_tokens": usage.get('completion_tokens', 0),
+            })
 
     return stage1_results
 
@@ -79,6 +92,13 @@ async def stage2_collect_rankings(
     Returns:
         Tuple of (rankings list, label_to_model mapping)
     """
+    # Only responses with real text are ranked. Empty/errored seats used to be
+    # handed to every peer as a blank "Response X" and could land in the
+    # aggregate ranking; they are now excluded (stage 1 still records them).
+    all_stage1 = stage1_results
+    stage1_results = [r for r in all_stage1 if r.get("status", "ok") in ("ok", "truncated")]
+    if len(stage1_results) < 2:
+        return [], {}  # nothing to compare: skip peer review rather than rank one answer
     # Create anonymized labels for responses (Response A, Response B, etc.)
     labels = [chr(65 + i) for i in range(len(stage1_results))]  # A, B, C, ...
 
@@ -89,8 +109,9 @@ async def stage2_collect_rankings(
     }
 
     # Build the ranking prompt
+    CUT = "\n\n[NOTE TO RANKER: this response was cut off at the output limit; sections after this point were never written. Do not credit or guess content that is not shown.]"
     responses_text = "\n\n".join([
-        f"Response {label}:\n{result['response']}"
+        f"Response {label}:\n{result['response']}" + (CUT if result.get("status") == "truncated" else "")
         for label, result in zip(labels, stage1_results)
     ])
 
@@ -134,8 +155,8 @@ Now provide your evaluation and ranking:"""
     # Format results
     stage2_results = []
     for seat_label, response in responses.items():
-        if response is not None:
-            full_text = response.get('content', '')
+        if response is not None and not is_empty(response):
+            full_text = response.get('content') or ''
             parsed = parse_ranking_from_text(full_text)
             stage2_results.append({
                 "model": f"{response['provider']}/{response['model']}",
@@ -178,10 +199,21 @@ async def stage3_synthesize_final(
         Dict with 'model' and 'response' keys
     """
     # Build comprehensive context for chairman
-    stage1_text = "\n\n".join([
-        f"Model: {result['model']}\nResponse: {result['response']}"
-        for result in stage1_results
-    ])
+    def _stage1_block(result):
+        status = result.get("status", "ok")
+        if status in ("empty", "error"):
+            return f"Model: {result['model']}\nResponse: [NO RESPONSE: {status}. Contributes nothing.]"
+        note = "\n[This response was CUT OFF at the output limit; later sections do not exist.]" if status == "truncated" else ""
+        return f"Model: {result['model']}\nResponse: {result['response']}{note}"
+
+    stage1_text = "\n\n".join(_stage1_block(r) for r in stage1_results)
+    n_total = len(stage1_results)
+    n_ok = sum(1 for r in stage1_results if r.get("status", "ok") == "ok")
+    n_cut = sum(1 for r in stage1_results if r.get("status") == "truncated")
+    n_none = n_total - n_ok - n_cut
+    health = (f"COUNCIL HEALTH: {n_total} seats asked; {n_ok} complete, {n_cut} cut off, {n_none} returned nothing. "
+              f"Peer ranking covered only the {n_ok + n_cut} that returned text. "
+              "No seat had web access or could open links: no URL, figure or source in any response was checked.")
 
     stage2_text = "\n\n".join([
         f"Model: {result['model']}\nRanking: {result['ranking']}"
@@ -191,6 +223,8 @@ async def stage3_synthesize_final(
     chairman_prompt = f"""You are the Chairman of an LLM Council. Multiple AI models have provided responses to a user's question, and then ranked each other's responses.
 
 Original Question: {user_query}
+
+{health}
 
 STAGE 1 - Individual Responses:
 {stage1_text}
@@ -202,6 +236,12 @@ Your task as Chairman is to synthesize all of this information into a single, co
 - The individual responses and their insights
 - The peer rankings and what they reveal about response quality
 - Any patterns of agreement or disagreement
+
+Rules for the synthesis:
+- Open with one line stating the COUNCIL HEALTH above, in your own words (how many real reviews this is).
+- Use ONLY what the responses support. If no complete response covers a part of the question, write "NOT COVERED" for that part. Do not fill it in from your own knowledge or invent it, and do not present a cut-off response as finished.
+- Where a response invented facts about material it was not given, or contradicted the question's own rules, say so and do not repeat it as a finding.
+- Say plainly that nothing was browsed or source-checked if the question asked for that.
 
 Provide a clear, well-reasoned final answer that represents the council's collective wisdom:"""
 
@@ -215,11 +255,12 @@ Provide a clear, well-reasoned final answer that represents the council's collec
     effective_chairman = enrich_model_spec(chairman_model) if chairman_model else CHAIRMAN_MODEL
     response = await query_model(effective_chairman, messages, max_tokens=effective_chairman_max_tokens)
 
-    if response is None:
-        # Fallback if chairman fails
+    if response is None or is_empty(response):
+        # Fallback if chairman fails (error OR blank reply)
         return {
             "model": "error",
-            "response": "Error: Unable to generate final synthesis."
+            "response": "Error: Unable to generate final synthesis.",
+            "status": "error",
         }
 
     if cost_log is not None:
@@ -232,7 +273,9 @@ Provide a clear, well-reasoned final answer that represents the council's collec
 
     return {
         "model": f"{response['provider']}/{response['model']}",
-        "response": response.get('content', '')
+        "response": response.get('content') or '',
+        "status": "empty" if response.get('empty') else "truncated" if response.get('truncated') else "ok",
+        "finish_reason": response.get('finish_reason'),
     }
 
 
@@ -343,7 +386,7 @@ Title:"""
         # Fallback to a generic title
         return "New Conversation"
 
-    title = response.get('content', 'New Conversation').strip()
+    title = (response.get('content') or '').strip() or 'New Conversation'
 
     # Clean up the title - remove quotes, limit length
     title = title.strip('"\'')
@@ -383,8 +426,8 @@ async def run_full_council(
     stage1_results = await stage1_collect_responses(user_query, council_models, council_max_tokens, cost_log)
 
     # If no models responded successfully, return error
-    if not stage1_results:
-        return [], [], {
+    if not any(r.get("status", "ok") in ("ok", "truncated") for r in stage1_results):
+        return stage1_results, [], {
             "model": "error",
             "response": "All models failed to respond. Please try again."
         }, {}

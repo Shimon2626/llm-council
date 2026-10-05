@@ -34,6 +34,12 @@ DEFAULT_MAX_TOKENS = int(os.getenv("COUNCIL_MAX_TOKENS", "8000"))
 # so it needs more completion room or it truncates mid-sentence (observed
 # 2026-07-14 with the 2000-token default).
 CHAIRMAN_MAX_TOKENS = int(os.getenv("CHAIRMAN_MAX_TOKENS", "16000"))
+# Reasoning models spend max_tokens on hidden reasoning first; when that
+# exhausts the cap the reply is EMPTY (content null, finish_reason "length")
+# or cut off mid-sentence. query_model retries once with a doubled cap, never
+# above this ceiling (a cap far past a model's real window risks a 400, which
+# then just falls through to the next provider like any other error).
+RETRY_MAX_TOKENS_CEILING = int(os.getenv("COUNCIL_RETRY_MAX_TOKENS_CEILING", "32000"))
 
 
 async def _call_provider(
@@ -60,12 +66,18 @@ async def _call_provider(
         response.raise_for_status()
 
         data = response.json()
-        message = data['choices'][0]['message']
+        choice = data['choices'][0]
+        message = choice['message']
         usage = data.get('usage') or {}
+        details = usage.get('completion_tokens_details') or {}
 
         return {
             'content': message.get('content'),
             'reasoning_details': message.get('reasoning_details'),
+            # "length" = hit max_tokens (truncated or reasoning-exhausted);
+            # "stop" = finished on its own. Without this a cut-off reply is
+            # indistinguishable from a complete one.
+            'finish_reason': choice.get('finish_reason'),
             # Real token counts from the provider's response, not an estimate —
             # backs the actual (post-run) cost, distinct from pricing.py's
             # pre-run worst-case estimate. Both OpenAI-compatible providers
@@ -74,8 +86,14 @@ async def _call_provider(
             'usage': {
                 'prompt_tokens': usage.get('prompt_tokens', 0),
                 'completion_tokens': usage.get('completion_tokens', 0),
+                'reasoning_tokens': details.get('reasoning_tokens', 0),
             },
         }
+
+
+def is_empty(response: Optional[Dict[str, Any]]) -> bool:
+    """True if a provider answered but returned no usable text."""
+    return response is None or not (response.get('content') or '').strip()
 
 
 async def query_model(
@@ -105,23 +123,49 @@ async def query_model(
     if isinstance(model_spec, str):
         model_spec = {"openrouter": model_spec}
 
+    soft_failure = None  # an answer that arrived but was empty/cut off
+    spent = {'prompt_tokens': 0, 'completion_tokens': 0, 'reasoning_tokens': 0}  # billed across retries
     for provider in ("nvidia", "openrouter"):
         model = model_spec.get(provider)
         if not model:
             continue
         effective_timeout = timeout if timeout is not None else PROVIDER_TIMEOUTS[provider]
-        try:
-            result = await _call_provider(provider, model, messages, effective_timeout, max_tokens)
+        cap = max_tokens
+        for attempt in (1, 2):
+            try:
+                result = await _call_provider(provider, model, messages, effective_timeout, cap)
+            except Exception as e:
+                # httpx timeout/connection errors often stringify to "" — fall
+                # back to the exception class name so the log line is never blank.
+                reason = str(e) or type(e).__name__
+                print(f"Error querying {provider}/{model}: {reason}")
+                break  # hard error: next provider
+            for k in spent:
+                spent[k] += (result.get('usage') or {}).get(k, 0)
+            result['usage'] = dict(spent)  # a retry is billed too: report all of it
             result['provider'] = provider
             result['model'] = model
-            return result
-        except Exception as e:
-            # httpx timeout/connection errors often stringify to "" — fall
-            # back to the exception class name so the log line is never blank.
-            reason = str(e) or type(e).__name__
-            print(f"Error querying {provider}/{model}: {reason}")
+            result['attempts'] = attempt
+            result['max_tokens_used'] = cap
+            result['empty'] = is_empty(result)
+            result['truncated'] = (not result['empty']) and result.get('finish_reason') == 'length'
+            if not result['empty'] and not result['truncated']:
+                return result
+            print(f"Weak reply from {provider}/{model}: "
+                  f"{'empty' if result['empty'] else 'truncated'} "
+                  f"(finish_reason={result.get('finish_reason')}, cap={cap}, attempt={attempt})")
+            if soft_failure is None or (soft_failure['empty'] and not result['empty']):
+                soft_failure = result
+            bigger = min(cap * 2, RETRY_MAX_TOKENS_CEILING)
+            if attempt == 1 and result.get('finish_reason') == 'length' and bigger > cap:
+                cap = bigger  # one retry with more room
+                continue
+            break  # retry not useful (or already done): next provider
 
-    return None
+    # Every provider failed outright -> None. Otherwise hand back the best weak
+    # reply, flagged empty/truncated, so callers can see WHY instead of getting
+    # a blank that looks like success.
+    return soft_failure
 
 
 async def query_models_parallel(

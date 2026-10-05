@@ -274,9 +274,19 @@ export default function ChatInterface({
       lines.push(`## Query`, ``, userQuery, ``);
     }
 
+    const s1 = msg.stage1 || [];
+    const okN = s1.filter((r) => (r.status || 'ok') === 'ok').length;
+    const cutN = s1.filter((r) => r.status === 'truncated').length;
+    lines.push(
+      `## Council health`, ``,
+      `${s1.length} seats asked: ${okN} complete, ${cutN} cut off, ${s1.length - okN - cutN} returned nothing. Only complete answers count as full reviews.`,
+      `No seat had web access: no source or figure was checked.`, ``
+    );
     lines.push(`## Stage 1 — Individual Responses`, ``);
-    (msg.stage1 || []).forEach((r) => {
-      lines.push(`### ${r.model}`, ``, r.response, ``);
+    if (s1.length === 0) lines.push(`_No Stage 1 data was available to this export._`, ``);
+    s1.forEach((r) => {
+      const st = r.status && r.status !== 'ok' ? ` — ${r.status.toUpperCase()} (finish_reason=${r.finish_reason}, ${r.completion_tokens} completion tokens)` : '';
+      lines.push(`### ${r.model}${st}`, ``, r.response || '_(no text returned)_', ``);
     });
 
     lines.push(`## Stage 2 — Peer Rankings`, ``);
