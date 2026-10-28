@@ -32,30 +32,38 @@ npm install
 cd ..
 ```
 
-### 2. Configure API Key
+### 2. Configure API Keys
 
-Create a `.env` file in the project root:
+Copy the example file and fill in your own keys (`.env` is git-ignored, never commit it):
 
 ```bash
-OPENROUTER_API_KEY=sk-or-v1-...
+cp .env.example .env
 ```
 
-Get your API key at [openrouter.ai](https://openrouter.ai/). Make sure to purchase the credits you need, or sign up for automatic top up.
+- `OPENROUTER_API_KEY` (required): get it at [openrouter.ai](https://openrouter.ai/) and add credits or automatic top up. Each person pays from their own balance.
+- `NVIDIA_API_KEY` (optional): NVIDIA NIM free tier, tried first for seats it serves.
+
+Provider order per seat is NVIDIA, then OpenRouter `:free`, then paid OpenRouter. Free OpenRouter models can be rate limited, and their data-use terms are not reviewed here; check them before sending sensitive material.
 
 ### 3. Configure Models (Optional)
 
-Edit `backend/config.py` to customize the council:
+Edit `backend/config.py`. Each seat maps providers to model slugs:
 
 ```python
 COUNCIL_MODELS = [
-    "openai/gpt-5.1",
-    "google/gemini-3-pro-preview",
-    "anthropic/claude-sonnet-4.5",
-    "x-ai/grok-4",
+    {"openrouter": "moonshotai/kimi-k3"},
+    {"nvidia": "nvidia/nemotron-3-ultra-550b-a55b",
+     "openrouter_free": "nvidia/nemotron-3-ultra-550b-a55b:free",
+     "openrouter": "nvidia/nemotron-3-ultra-550b-a55b"},
 ]
-
-CHAIRMAN_MODEL = "google/gemini-3-pro-preview"
+CHAIRMAN_MODEL = {"openrouter": "moonshotai/kimi-k3"}
 ```
+
+Check a slug against the provider's model list before adding it.
+
+### Attachments
+
+The chat accepts text files, `.zip`, `.docx`, `.xlsx` and `.pptx` (text is extracted on the server, 10 MB limit). Binary content sent as a query is rejected.
 
 ## Running the Application
 
@@ -79,9 +87,13 @@ npm run dev
 
 Then open http://localhost:5173 in your browser.
 
+## Hosting for a team
+
+See `deploy/DEPLOY_20261005_1730.md` for running one shared copy on a server behind an access gate.
+
 ## Tech Stack
 
-- **Backend:** FastAPI (Python 3.10+), async httpx, OpenRouter API
+- **Backend:** FastAPI (Python 3.10+), async httpx, NVIDIA NIM and OpenRouter APIs
 - **Frontend:** React + Vite, react-markdown for rendering
 - **Storage:** JSON files in `data/conversations/`
 - **Package Management:** uv for Python, npm for JavaScript
