@@ -2,7 +2,31 @@
  * API client for the LLM Council backend.
  */
 
-const API_BASE = 'http://localhost:8001';
+// Dev (vite) talks to the backend directly; a production build is served from
+// the same hostname as the API (nginx proxies /api), so the base is empty.
+const API_BASE = import.meta.env.DEV ? 'http://localhost:8001' : '';
+
+// Server validation errors (422) arrive as {detail: [{msg}]} or {detail: "..."};
+// surface the readable message instead of a generic "Failed to ...".
+async function errorFromResponse(response, fallback) {
+  const body = await response.json().catch(() => ({}));
+  const d = body.detail;
+  const msg = Array.isArray(d)
+    ? d.map((x) => String(x.msg || '').replace(/^Value error, /, '')).filter(Boolean).join('; ')
+    : d;
+  return new Error(msg || fallback);
+}
+
+// Binary containers can't go through FileReader.readAsText (it returns raw
+// zip bytes, not the document text), so they are extracted server-side.
+// Module-level (not an api method) because callers pass api.extract* as bare callbacks.
+async function postFile(path, file, fallback) {
+  const formData = new FormData();
+  formData.append('file', file);
+  const response = await fetch(`${API_BASE}${path}`, { method: 'POST', body: formData });
+  if (!response.ok) throw await errorFromResponse(response, fallback);
+  return response.json();
+}
 
 export const api = {
   /**
@@ -61,7 +85,7 @@ export const api = {
       }),
     });
     if (!response.ok) {
-      throw new Error('Failed to estimate cost');
+      throw await errorFromResponse(response, 'Failed to estimate cost');
     }
     return response.json();
   },
@@ -97,42 +121,16 @@ export const api = {
     return response.json();
   },
 
-  /**
-   * Extract readable text from a .zip file's contents server-side (a zip
-   * is binary — reading it with FileReader.readAsText, like the other
-   * attachment types below, would produce garbage, not usable content).
-   */
-  async extractZip(file) {
-    const formData = new FormData();
-    formData.append('file', file);
-    const response = await fetch(`${API_BASE}/api/extract-zip`, {
-      method: 'POST',
-      body: formData,
-    });
-    if (!response.ok) {
-      const body = await response.json().catch(() => ({}));
-      throw new Error(body.detail || 'Failed to extract zip file');
-    }
-    return response.json();
+  extractZip(file) {
+    return postFile('/api/extract-zip', file, 'Failed to extract zip file');
   },
 
-  /**
-   * Extract readable text from a .docx file's contents server-side (like
-   * .zip above, a .docx is binary — FileReader.readAsText would return the
-   * raw zip bytes, not the document's actual text).
-   */
-  async extractDocx(file) {
-    const formData = new FormData();
-    formData.append('file', file);
-    const response = await fetch(`${API_BASE}/api/extract-docx`, {
-      method: 'POST',
-      body: formData,
-    });
-    if (!response.ok) {
-      const body = await response.json().catch(() => ({}));
-      throw new Error(body.detail || 'Failed to extract docx file');
-    }
-    return response.json();
+  extractDocx(file) {
+    return postFile('/api/extract-docx', file, 'Failed to extract docx file');
+  },
+
+  extractOffice(file) {
+    return postFile('/api/extract-office', file, 'Failed to extract Office file');
   },
 
   /**
@@ -191,7 +189,7 @@ export const api = {
       }
     );
     if (!response.ok) {
-      throw new Error('Failed to send message');
+      throw await errorFromResponse(response, 'Failed to send message');
     }
     return response.json();
   },
@@ -223,7 +221,7 @@ export const api = {
     );
 
     if (!response.ok) {
-      throw new Error('Failed to send message');
+      throw await errorFromResponse(response, 'Failed to send message');
     }
 
     const reader = response.body.getReader();

@@ -1,0 +1,16 @@
+# Install as /etc/systemd/system/llm-council.service
+[Unit]
+Description=LLM Council backend
+After=network.target
+
+[Service]
+Type=simple
+User=council
+WorkingDirectory=/opt/llm-council
+EnvironmentFile=/opt/llm-council/.env
+Environment=COUNCIL_HOST=127.0.0.1 COUNCIL_PORT=8001 COUNCIL_RELOAD=0
+ExecStart=/opt/llm-council/.venv/bin/python -m backend.main
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

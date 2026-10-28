@@ -88,18 +88,20 @@ def update_api_keys(nvidia_api_key=None, openrouter_api_key=None):
 
 # NVIDIA NIM is primary (free tier); OpenRouter is the fallback (paid,
 # ~$19.92 balance as of 2026-07-13) used only if the NVIDIA call fails.
-# Every model on both sides was verified live against that provider's
-# /models endpoint on 2026-07-13 — do not add a slug without checking.
+# Every model on both sides was re-verified live against that provider's
+# /models endpoint on 2026-10-05 (stale 2026-07 slugs replaced; Kimi K3 added) — do not add a slug without checking.
+# 2026-10-28 live re-check: NVIDIA no longer lists kimi-k3, returns 410 for glm-5.3, and hangs on gemma-4-31b-it and
+# deepseek-v4.1-flash, so those seats are OpenRouter-only (paid) — see the per-seat comments below.
 COUNCIL_MODELS = [
-    {"nvidia": "meta/llama-4-maverick-17b-128e-instruct", "openrouter": "meta-llama/llama-4-maverick"},
-    {"nvidia": "mistralai/mistral-large-3-675b-instruct-2512", "openrouter": "mistralai/mistral-large-2512"},
-    {"nvidia": "microsoft/phi-4-mini-instruct", "openrouter": "microsoft/phi-4"},
-    {"nvidia": "google/gemma-4-31b-it", "openrouter": "google/gemma-4-31b-it"},
-    {"nvidia": "meta/llama-3.3-70b-instruct", "openrouter": "meta-llama/llama-3.3-70b-instruct"},
+    {"openrouter": "moonshotai/kimi-k3"},  # not in NVIDIA /v1/models as of 2026-10-28
+    {"openrouter": "z-ai/glm-5.3"},  # NVIDIA returns 410 Gone as of 2026-10-28
+    {"nvidia": "nvidia/nemotron-3-ultra-550b-a55b", "openrouter_free": "nvidia/nemotron-3-ultra-550b-a55b:free", "openrouter": "nvidia/nemotron-3-ultra-550b-a55b"},
+    {"openrouter_free": "google/gemma-4-31b-it:free", "openrouter": "google/gemma-4-31b-it"},  # NVIDIA hangs (3/3 probes >45s, 2026-10-28); free OpenRouter variant first
+    {"openrouter": "deepseek/deepseek-v4.1-flash"},  # NVIDIA call hangs (3/3 probes >25s, 2026-10-28)
 ]
 
 # Chairman model - synthesizes final response
-CHAIRMAN_MODEL = {"nvidia": "deepseek-ai/deepseek-v4-pro", "openrouter": "deepseek/deepseek-v4-pro"}
+CHAIRMAN_MODEL = {"openrouter": "moonshotai/kimi-k3"}  # no NVIDIA listing as of 2026-10-28
 
 # Data directory for conversation storage
 DATA_DIR = "data/conversations"
@@ -114,11 +116,7 @@ DATA_DIR = "data/conversations"
 # most AVAILABLE_MODELS entries (Claude, GPT-5.1, Grok, Sonar, meta/llama-3.1-
 # 70b-instruct) exist on only one provider and correctly have no equivalent.
 MODEL_EQUIVALENTS = {
-    ("nvidia", "meta/llama-4-maverick-17b-128e-instruct"): ("openrouter", "meta-llama/llama-4-maverick"),
-    ("nvidia", "mistralai/mistral-large-3-675b-instruct-2512"): ("openrouter", "mistralai/mistral-large-2512"),
-    ("nvidia", "google/gemma-4-31b-it"): ("openrouter", "google/gemma-4-31b-it"),
-    ("nvidia", "meta/llama-3.3-70b-instruct"): ("openrouter", "meta-llama/llama-3.3-70b-instruct"),
-    ("nvidia", "deepseek-ai/deepseek-v4-pro"): ("openrouter", "deepseek/deepseek-v4-pro"),
+    ("nvidia", "nvidia/nemotron-3-ultra-550b-a55b"): ("openrouter", "nvidia/nemotron-3-ultra-550b-a55b"),
 }
 # Mirror the reverse direction so an explicit OpenRouter pick also falls back to NVIDIA.
 MODEL_EQUIVALENTS.update({v: k for k, v in MODEL_EQUIVALENTS.items()})
@@ -185,26 +183,31 @@ def enrich_council_models(council_models):
 # =============================================================================
 AVAILABLE_MODELS = {
     "nvidia": [
-        "meta/llama-3.1-70b-instruct",
-        "meta/llama-3.3-70b-instruct",
-        "meta/llama-4-maverick-17b-128e-instruct",
-        "mistralai/mistral-large-3-675b-instruct-2512",
-        "google/gemma-4-31b-it",
-        "deepseek-ai/deepseek-v4-pro",
+        "nvidia/nemotron-3-ultra-550b-a55b",
+        "nvidia/nemotron-3-super-120b-a12b",
     ],
     "openrouter": [
-        "openai/gpt-5.1",
+        "google/gemma-4-31b-it:free",
+        "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "thinkingmachines/inkling:free",
+        "poolside/laguna-s-2.1:free",
+        "moonshotai/kimi-k3",
+        "openai/gpt-6.1-sol",
+        "openai/gpt-6.1-sol-pro",
+        "anthropic/claude-opus-5.5",
+        "anthropic/claude-sonnet-5.5",
+        "anthropic/claude-fable-5.1",
+        "google/gemini-3.8-flash",
         "google/gemini-3.1-pro-preview",
-        "anthropic/claude-sonnet-5",
-        "anthropic/claude-opus-4.8",
-        "x-ai/grok-4.5",
-        "perplexity/sonar",
-        "meta-llama/llama-4-maverick",
-        "meta-llama/llama-3.3-70b-instruct",
-        "mistralai/mistral-large-2512",
-        "microsoft/phi-4",
+        "x-ai/grok-4.7",
+        "qwen/qwen3.8-max-prime",
+        "z-ai/glm-5.3",
+        "deepseek/deepseek-v4-pro-0813",
+        "deepseek/deepseek-v4.1-flash",
+        "mistralai/mistral-medium-3-5",
+        "perplexity/sonar-pro",
+        "nvidia/nemotron-3-ultra-550b-a55b",
         "google/gemma-4-31b-it",
-        "deepseek/deepseek-v4-pro",
     ],
 }
 

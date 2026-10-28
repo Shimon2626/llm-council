@@ -3,12 +3,14 @@
 from fastapi import FastAPI, HTTPException, File, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from typing import List, Dict, Any, Optional
+import os
 import uuid
 import json
 import asyncio
 import io
+import re
 import zipfile
 import xml.etree.ElementTree as ET
 
@@ -39,6 +41,15 @@ MAX_DOCX_EXTRACT_CHARS = 100_000
 # A .docx is a zip of XML parts; this is the WordprocessingML namespace its
 # text lives under (word/document.xml's <w:p> paragraphs / <w:t> runs).
 DOCX_WORD_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+MAX_OFFICE_EXTRACT_CHARS = MAX_DOCX_EXTRACT_CHARS
+XLSX_MAIN_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+PPTX_DRAWING_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+
+
+def _natural_key(name: str):
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", name)]
+
 
 class ClientStopped(Exception):
     """Raised when the browser side (Stop button or tab close) has gone
@@ -79,14 +90,31 @@ async def _run_with_heartbeat(coro, request: Request, heartbeat_interval: float 
 
 app = FastAPI(title="LLM Council API")
 
-# Enable CORS for local development
+# CORS: localhost for development; extra origins (e.g. a hosted hostname) via
+# the COUNCIL_CORS_ORIGINS env var, comma-separated. A same-origin hosted
+# deployment (nginx serving the UI and proxying /api) needs none.
+_cors_origins = ["http://localhost:5173", "http://localhost:3000"] + [
+    o.strip() for o in os.getenv("COUNCIL_CORS_ORIGINS", "").split(",") if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _reject_binary_content(value: str) -> str:
+    """Refuse a query whose text is really decoded binary (an attached
+    .xlsx/.pdf/etc. read as text) before any paid model call is made."""
+    sample = value[:200_000]
+    if "\x00" in sample or sample.count("\ufffd") > 20:
+        raise ValueError(
+            "Query contains binary file data (an attachment was read as text). "
+            "Remove the attachment, or attach a supported type (.docx, .xlsx, .pptx, .zip, text/CSV)."
+        )
+    return value
 
 
 class CreateConversationRequest(BaseModel):
@@ -94,9 +122,18 @@ class CreateConversationRequest(BaseModel):
     pass
 
 
-class SendMessageRequest(BaseModel):
-    """Request to send a message in a conversation."""
+class _ContentRequest(BaseModel):
     content: str
+
+    @field_validator("content")
+    @classmethod
+    def _content_not_binary(cls, v: str) -> str:
+        return _reject_binary_content(v)
+
+
+class SendMessageRequest(_ContentRequest):
+    """Request to send a message in a conversation."""
+
     # Optional per-request overrides — each a single-provider spec like
     # {"nvidia": "meta/llama-3.1-70b-instruct"} or {"openrouter": "openai/gpt-5.1"}.
     # If omitted, falls back to config.COUNCIL_MODELS / config.CHAIRMAN_MODEL.
@@ -109,9 +146,9 @@ class SendMessageRequest(BaseModel):
     chairman_max_tokens: Optional[int] = None
 
 
-class EstimateCostRequest(BaseModel):
+class EstimateCostRequest(_ContentRequest):
     """Request to estimate the cost of a council run before sending it."""
-    content: str
+
     council_models: Optional[List[Dict[str, str]]] = None
     chairman_model: Optional[Dict[str, str]] = None
 
@@ -246,6 +283,120 @@ async def extract_docx(file: UploadFile = File(...)):
     }
 
 
+MAX_OFFICE_UPLOAD_BYTES = 10 * 1024 * 1024
+MAX_OFFICE_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
+OFFICE_REL_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+
+
+def _read_xml(zf: zipfile.ZipFile, name: str):
+    data = zf.read(name)
+    if b"<!ENTITY" in data:  # entity-expansion guard; real Office XML never declares entities
+        raise ValueError("DTD entities are not allowed")
+    return ET.fromstring(data)
+
+
+def _xlsx_sheets(zf: zipfile.ZipFile, names: set):
+    """(sheet name, part path) in workbook order, resolved through workbook.xml.rels."""
+    if "xl/workbook.xml" in names and "xl/_rels/workbook.xml.rels" in names:
+        targets = {
+            r.get("Id"): r.get("Target", "").lstrip("/")
+            for r in _read_xml(zf, "xl/_rels/workbook.xml.rels")
+        }
+        out = []
+        for sh in _read_xml(zf, "xl/workbook.xml").iter(f"{XLSX_MAIN_NS}sheet"):
+            target = targets.get(sh.get(f"{OFFICE_REL_NS}id"), "")
+            path = target if target.startswith("xl/") else f"xl/{target}"
+            if path in names:
+                out.append((sh.get("name", path), path))
+        if out:
+            return out
+    files = sorted((n for n in names if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", n)), key=_natural_key)
+    return [(f, f) for f in files]
+
+
+def _xlsx_to_text(zf: zipfile.ZipFile, names: set) -> str:
+    """Sheet-by-sheet tab-separated text from an .xlsx's XML parts."""
+    shared = []
+    if "xl/sharedStrings.xml" in names:
+        for si in _read_xml(zf, "xl/sharedStrings.xml").iter(f"{XLSX_MAIN_NS}si"):
+            shared.append("".join(t.text or "" for t in si.iter(f"{XLSX_MAIN_NS}t")))
+
+    parts, total = [], 0
+    for sheet_name, path in _xlsx_sheets(zf, names):
+        rows = []
+        for row in _read_xml(zf, path).iter(f"{XLSX_MAIN_NS}row"):
+            cells = []
+            for c in row.iter(f"{XLSX_MAIN_NS}c"):
+                v = c.find(f"{XLSX_MAIN_NS}v")
+                if c.get("t") == "s" and v is not None and v.text is not None:
+                    i = int(v.text)
+                    cells.append(shared[i] if i < len(shared) else "")
+                elif c.get("t") == "inlineStr":
+                    cells.append("".join(t.text or "" for t in c.iter(f"{XLSX_MAIN_NS}t")))
+                else:
+                    cells.append(v.text if v is not None and v.text is not None else "")
+            if any(cells):
+                line = "\t".join(cells)
+                rows.append(line)
+                total += len(line)
+            if total > MAX_OFFICE_EXTRACT_CHARS:
+                break
+        parts.append(f"--- Sheet: {sheet_name} ---\n" + "\n".join(rows))
+        if total > MAX_OFFICE_EXTRACT_CHARS:
+            break
+    return "\n\n".join(parts)
+
+
+def _pptx_to_text(zf: zipfile.ZipFile, names: set) -> str:
+    """Slide-by-slide text from a .pptx's XML parts."""
+    slides = sorted((n for n in names if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)), key=_natural_key)
+    parts, total = [], 0
+    for fname in slides:
+        n = int(re.search(r"slide(\d+)\.xml", fname).group(1))
+        paras = [
+            "".join(t.text or "" for t in p.iter(f"{PPTX_DRAWING_NS}t"))
+            for p in _read_xml(zf, fname).iter(f"{PPTX_DRAWING_NS}p")
+        ]
+        body = "\n".join(p for p in paras if p)
+        parts.append(f"--- Slide {n} ---\n{body}")
+        total += len(body)
+        if total > MAX_OFFICE_EXTRACT_CHARS:
+            break
+    return "\n\n".join(parts)
+
+
+def _extract_office_text(raw: bytes, filename: str) -> str:
+    """Blocking zip/XML work, run via asyncio.to_thread. Raises ValueError for a bad or oversized file."""
+    lower = filename.lower()
+    if not lower.endswith((".xlsx", ".pptx")):
+        raise ValueError(f"{filename!r} is not an .xlsx or .pptx file")
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(raw))
+        if sum(i.file_size for i in zf.infolist()) > MAX_OFFICE_UNCOMPRESSED_BYTES:
+            raise ValueError(f"{filename!r} expands to more than {MAX_OFFICE_UNCOMPRESSED_BYTES // (1024 * 1024)} MB")
+        names = set(zf.namelist())
+        return _xlsx_to_text(zf, names) if lower.endswith(".xlsx") else _pptx_to_text(zf, names)
+    except (zipfile.BadZipFile, KeyError, ET.ParseError):
+        raise ValueError(f"Could not read {filename!r} as an Office file")
+
+
+@app.post("/api/extract-office")
+async def extract_office(file: UploadFile = File(...)):
+    """Extracts readable text from an uploaded .xlsx or .pptx (zip of XML
+    parts, stdlib only). Same reason as /api/extract-docx: readAsText on
+    these returns raw zip bytes, which reached the council as garbage."""
+    raw = await file.read()
+    if len(raw) > MAX_OFFICE_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=f"{file.filename!r} is larger than {MAX_OFFICE_UPLOAD_BYTES // (1024 * 1024)} MB")
+    try:
+        text = await asyncio.to_thread(_extract_office_text, raw, file.filename or "")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    truncated = len(text) > MAX_OFFICE_EXTRACT_CHARS
+    return {"extracted_text": text[:MAX_OFFICE_EXTRACT_CHARS], "truncated": truncated}
+
+
 @app.get("/api/config/status")
 async def get_config_status():
     """Whether each provider's API key is currently configured — booleans
@@ -360,7 +511,8 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
         stage1_results,
         stage2_results,
         stage3_result,
-        metadata.get("actual_cost")
+        metadata.get("actual_cost"),
+        metadata or None
     )
 
     # Return the complete response with metadata
@@ -455,7 +607,8 @@ async def send_message_stream(conversation_id: str, body: SendMessageRequest, ht
                 stage1_results,
                 stage2_results,
                 stage3_result,
-                actual_cost
+                actual_cost,
+                {"label_to_model": label_to_model, "aggregate_rankings": aggregate_rankings}
             )
 
             # Send completion event
@@ -492,8 +645,10 @@ if __name__ == "__main__":
     # data/conversations/*.json writes (every message) and reload on those.
     uvicorn.run(
         "backend.main:app",
-        host="0.0.0.0",
-        port=8001,
-        reload=True,
+        # Hosted deployment: COUNCIL_HOST=127.0.0.1, COUNCIL_RELOAD=0 (nginx
+        # fronts it). Defaults keep local dev behavior unchanged.
+        host=os.getenv("COUNCIL_HOST", "0.0.0.0"),
+        port=int(os.getenv("COUNCIL_PORT", "8001")),
+        reload=os.getenv("COUNCIL_RELOAD", "1") == "1",
         reload_dirs=["backend"],
     )
