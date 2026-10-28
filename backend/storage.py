@@ -132,7 +132,8 @@ def add_assistant_message(
     stage1: List[Dict[str, Any]],
     stage2: List[Dict[str, Any]],
     stage3: Dict[str, Any],
-    actual_cost: Optional[Dict[str, Any]] = None
+    actual_cost: Optional[Dict[str, Any]] = None,
+    metadata: Optional[Dict[str, Any]] = None
 ):
     """
     Add an assistant message with all 3 stages to a conversation.
@@ -145,6 +146,10 @@ def add_assistant_message(
         actual_cost: real (not estimated) cost of this run — see
             pricing.compute_actual_cost. Persisted so it's still there after
             reloading the conversation, not just visible in the live stream.
+        metadata: Stage 2 context ("label_to_model" and "aggregate_rankings"),
+            persisted so the label map and aggregate survive a reload — the
+            frontend reads these from msg.metadata. Messages saved before this
+            field existed simply have no "metadata" key.
     """
     conversation = get_conversation(conversation_id)
     if conversation is None:
@@ -158,6 +163,11 @@ def add_assistant_message(
     }
     if actual_cost is not None:
         message["actual_cost"] = actual_cost
+    if metadata is not None:
+        message["metadata"] = {
+            "label_to_model": metadata.get("label_to_model"),
+            "aggregate_rankings": metadata.get("aggregate_rankings"),
+        }
 
     conversation["messages"].append(message)
 
