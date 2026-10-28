@@ -188,7 +188,10 @@ function App() {
       }, councilModels, chairmanModel, councilMaxTokens, chairmanMaxTokens, controller.signal);
     } catch (error) {
       const wasStopped = error.name === 'AbortError';
-      if (!wasStopped) console.error('Failed to send message:', error);
+      if (!wasStopped) {
+        console.error('Failed to send message:', error);
+        alert(error.message);
+      }
       // Keep whatever partial stage data already streamed in — a dropped
       // connection mid-run used to wipe both the user's message and the
       // partial assistant reply, which is what made this look like the

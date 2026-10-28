@@ -6,6 +6,12 @@ from .config import COUNCIL_MODELS, CHAIRMAN_MODEL, enrich_model_spec, enrich_co
 from . import pricing
 
 
+UNREADABLE_ATTACHMENT_RULE = (
+    "If any attachment or part of the query is unreadable, garbled or appears "
+    "to be binary data, say so plainly and mark what you cannot judge. Never "
+    "infer, reconstruct or invent the contents of something you cannot read."
+)
+
 async def stage1_collect_responses(
     user_query: str,
     council_models: Optional[List[Dict[str, str]]] = None,
@@ -29,7 +35,10 @@ async def stage1_collect_responses(
     Returns:
         List of dicts with 'model' and 'response' keys
     """
-    messages = [{"role": "user", "content": user_query}]
+    messages = [
+        {"role": "system", "content": UNREADABLE_ATTACHMENT_RULE},
+        {"role": "user", "content": user_query},
+    ]
 
     # Query all models in parallel. Each explicitly-picked seat gets its
     # verified cross-provider equivalent backfilled (enrich_model_spec) so a
@@ -245,7 +254,10 @@ Rules for the synthesis:
 
 Provide a clear, well-reasoned final answer that represents the council's collective wisdom:"""
 
-    messages = [{"role": "user", "content": chairman_prompt}]
+    messages = [
+        {"role": "system", "content": UNREADABLE_ATTACHMENT_RULE},
+        {"role": "user", "content": chairman_prompt},
+    ]
 
     # Query the chairman model — larger token budget since it synthesizes
     # every stage1/stage2 response into one answer (see CHAIRMAN_MAX_TOKENS).

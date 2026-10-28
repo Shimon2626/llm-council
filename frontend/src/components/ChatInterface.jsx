@@ -158,74 +158,64 @@ export default function ChatInterface({
     files.forEach((file) => {
       const lowerName = file.name.toLowerCase();
       if (lowerName.endsWith('.zip')) {
-        uploadZipFile(file);
+        uploadExtracted(file, api.extractZip, zipHeader(file));
         return;
       }
       if (lowerName.endsWith('.docx')) {
-        uploadDocxFile(file);
+        uploadExtracted(file, api.extractDocx, textHeader(file));
+        return;
+      }
+      if (lowerName.endsWith('.xlsx') || lowerName.endsWith('.pptx')) {
+        uploadExtracted(file, api.extractOffice, textHeader(file));
         return;
       }
       const reader = new FileReader();
       reader.onload = () => {
-        setAttachments((prev) => [...prev, { name: file.name, content: reader.result }]);
+        // Binary files (pdf, images, .xls, ...) decode to U+FFFD garbage;
+        // refuse them rather than send noise to the council.
+        const text = String(reader.result);
+        const sample = text.slice(0, 4000);
+        if (sample.includes('\u0000') || (sample.match(/\uFFFD/g) || []).length > 5) {
+          alert(`${file.name} looks like a binary file and can't be attached as text.`);
+          return;
+        }
+        setAttachments((prev) => [...prev, { name: file.name, content: text, kind: 'text' }]);
       };
       reader.readAsText(file);
     });
     e.target.value = ''; // allow re-selecting the same file
   };
 
-  // Zip is binary — extracted server-side (api.extractZip) rather than
-  // read as text like other attachments. Shows an "extracting…" chip
-  // while the request is in flight; if the chip gets removed mid-upload,
-  // the result is discarded instead of resurrecting a removed attachment.
-  const uploadZipFile = async (file) => {
+  // Binary containers (.zip/.docx/.xlsx/.pptx) are extracted server-side.
+  // Shows an "extracting…" chip while the request is in flight; if the chip
+  // is removed mid-upload, the result is discarded instead of resurrecting it.
+  const uploadExtracted = async (file, extract, buildHeader) => {
     setAttachments((prev) => [...prev, { name: file.name, content: null, uploading: true }]);
     try {
-      const result = await api.extractZip(file);
-      const notes = [
-        result.files_skipped_binary.length > 0
-          ? `${result.files_skipped_binary.length} binary file(s) skipped`
-          : null,
-        result.files_skipped_oversized.length > 0
-          ? `${result.files_skipped_oversized.length} oversized file(s) skipped`
-          : null,
-        result.truncated ? 'content truncated to fit' : null,
-      ].filter(Boolean).join(', ');
-      const content =
-        `[Extracted ${result.files_extracted} file(s) from ${file.name}` +
-        `${notes ? ` — ${notes}` : ''}]\n\n${result.extracted_text}`;
+      const result = await extract(file);
+      const content = `${buildHeader(result)}\n\n${result.extracted_text}`;
       setAttachments((prev) =>
         prev.some((a) => a.name === file.name)
-          ? prev.map((a) => (a.name === file.name ? { name: file.name, content } : a))
+          ? prev.map((a) => (a.name === file.name ? { name: file.name, content, kind: 'extracted' } : a))
           : prev
       );
     } catch (error) {
-      console.error('Failed to extract zip:', error);
+      console.error(`Failed to extract ${file.name}:`, error);
       setAttachments((prev) => prev.filter((a) => a.name !== file.name));
       alert(`Could not extract ${file.name}: ${error.message}`);
     }
   };
 
-  // Same reasoning as uploadZipFile above: .docx is a binary zip container,
-  // not text, so it's extracted server-side (api.extractDocx) instead of
-  // going through the generic FileReader.readAsText path.
-  const uploadDocxFile = async (file) => {
-    setAttachments((prev) => [...prev, { name: file.name, content: null, uploading: true }]);
-    try {
-      const result = await api.extractDocx(file);
-      const content =
-        `[Extracted text from ${file.name}${result.truncated ? ' — content truncated to fit' : ''}]\n\n` +
-        result.extracted_text;
-      setAttachments((prev) =>
-        prev.some((a) => a.name === file.name)
-          ? prev.map((a) => (a.name === file.name ? { name: file.name, content } : a))
-          : prev
-      );
-    } catch (error) {
-      console.error('Failed to extract docx:', error);
-      setAttachments((prev) => prev.filter((a) => a.name !== file.name));
-      alert(`Could not extract ${file.name}: ${error.message}`);
-    }
+  const textHeader = (file) => (result) =>
+    `[Extracted text from ${file.name}${result.truncated ? ' — content truncated to fit' : ''}]`;
+
+  const zipHeader = (file) => (result) => {
+    const notes = [
+      result.files_skipped_binary.length > 0 ? `${result.files_skipped_binary.length} binary file(s) skipped` : null,
+      result.files_skipped_oversized.length > 0 ? `${result.files_skipped_oversized.length} oversized file(s) skipped` : null,
+      result.truncated ? 'content truncated to fit' : null,
+    ].filter(Boolean).join(', ');
+    return `[Extracted ${result.files_extracted} file(s) from ${file.name}${notes ? ` — ${notes}` : ''}]`;
   };
 
   const removeAttachment = (name) => {
@@ -271,7 +261,14 @@ export default function ChatInterface({
     const lines = [`# LLM Council Report`, ``, `**Date:** ${new Date().toISOString()}`, ``];
 
     if (userQuery) {
-      lines.push(`## Query`, ``, userQuery, ``);
+      // Show only a preview of each attached file so a bad extraction is
+      // visible at a glance without burying the report in the full file.
+      const trimmed = userQuery.replace(
+        /\*\*Attached file: ([^\n]*)\*\*\n```\n([\s\S]*?)\n```/g,
+        (_, name, body) =>
+          `**Attached file: ${name}** (${body.length.toLocaleString()} chars; first 600 shown)\n\`\`\`\n${body.slice(0, 600)}${body.length > 600 ? '\n…' : ''}\n\`\`\``
+      );
+      lines.push(`## Query`, ``, trimmed, ``);
     }
 
     const s1 = msg.stage1 || [];
@@ -294,11 +291,49 @@ export default function ChatInterface({
       lines.push(`### ${r.model}`, ``, r.ranking, ``);
     });
 
+    const NOT_RECORDED = `_not recorded for this conversation_`;
+    const cell = (v) => String(v).replace(/\|/g, '\\|');
+    const labelToModel = msg.metadata?.label_to_model;
     const aggregate = msg.metadata?.aggregate_rankings;
-    if (aggregate?.length) {
-      lines.push(`### Aggregate Rankings`, ``, `| Model | Average Rank | Rankings Count |`, `|---|---|---|`);
+
+    lines.push(`### Label map`, ``);
+    if (!labelToModel) {
+      lines.push(NOT_RECORDED, ``);
+    } else if (Object.keys(labelToModel).length === 0) {
+      lines.push(`_none: Stage 2 did not run (fewer than 2 usable Stage 1 answers)_`, ``);
+    } else {
+      lines.push(`| Label | Model |`, `|---|---|`);
+      Object.entries(labelToModel).forEach(([label, model]) => {
+        lines.push(`| ${cell(label)} | ${cell(model)} |`);
+      });
+      lines.push(``);
+    }
+
+    lines.push(`### Who ranked whom`, ``);
+    const reviewers = msg.stage2 || [];
+    if (!labelToModel) {
+      lines.push(NOT_RECORDED, ``);
+    } else if (reviewers.length === 0) {
+      lines.push(`_none: no reviewer returned a ranking_`, ``);
+    } else {
+      lines.push(`| Reviewer | Ranking, best to worst |`, `|---|---|`);
+      reviewers.forEach((r) => {
+        const parsed = r.parsed_ranking || [];
+        const named = parsed.map((label, i) => `${i + 1}. ${labelToModel[label] || `${label} (not in label map)`}`);
+        lines.push(`| ${cell(r.model)} | ${named.length ? cell(named.join('; ')) : '_no parsable ranking_'} |`);
+      });
+      lines.push(``);
+    }
+
+    lines.push(`### Aggregate Rankings`, ``);
+    if (!aggregate) {
+      lines.push(NOT_RECORDED, ``);
+    } else if (aggregate.length === 0) {
+      lines.push(`_none: no parsable rankings to aggregate_`, ``);
+    } else {
+      lines.push(`| Model | Average Rank | Rankings Count |`, `|---|---|---|`);
       aggregate.forEach((a) => {
-        lines.push(`| ${a.model} | ${a.average_rank} | ${a.rankings_count} |`);
+        lines.push(`| ${cell(a.model)} | ${a.average_rank} | ${a.rankings_count} |`);
       });
       lines.push(``);
     }
@@ -667,6 +702,11 @@ export default function ChatInterface({
                     Estimated max cost: ${costEstimate.estimated_cost_usd.toFixed(4)}
                   </span>
                   <span className="cost-estimate-note">{costEstimate.note}</span>
+                  {attachments.filter((a) => a.content !== null).map((a) => (
+                    <span key={a.name} className="cost-estimate-note">
+                      {a.name}: {a.kind === 'extracted' ? 'text extracted' : 'read as plain text'}, {a.content.length.toLocaleString()} chars
+                    </span>
+                  ))}
                 </>
               )}
             </div>

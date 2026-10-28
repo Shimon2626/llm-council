@@ -16,8 +16,13 @@ ModelSpec = Union[str, Dict[str, str]]
 # 2026-07-14: same model succeeded in <1s on one call and hung >2min on the
 # next). A short timeout here means a stuck NVIDIA call fails over to
 # OpenRouter quickly instead of blocking the whole council for minutes.
+# "openrouter_free" is a billing tier, not a separate service: same API and
+# key as "openrouter", called with a ":free" model slug ($0, rate-limited).
+PROVIDER_ALIASES = {"openrouter_free": "openrouter"}
+PROVIDER_ORDER = ("nvidia", "openrouter_free", "openrouter")
 PROVIDER_TIMEOUTS = {
     "nvidia": 20.0,
+    "openrouter_free": 30.0,
     "openrouter": 120.0,
 }
 
@@ -50,7 +55,7 @@ async def _call_provider(
     max_tokens: int
 ) -> Dict[str, Any]:
     """Make one call against a named provider. Raises on any failure."""
-    cfg = PROVIDERS[provider]
+    cfg = PROVIDERS[PROVIDER_ALIASES.get(provider, provider)]
     headers = {
         "Authorization": f"Bearer {cfg['api_key']}",
         "Content-Type": "application/json",
@@ -108,8 +113,10 @@ async def query_model(
     Args:
         model_spec: either a plain model string (queried via OpenRouter, for
             backward-compat single-provider calls like title generation), or
-            a dict like {"nvidia": "...", "openrouter": "..."} tried in that
-            order — NVIDIA (free) first, OpenRouter (paid) as fallback.
+            a dict like {"nvidia": "...", "openrouter_free": "...:free",
+            "openrouter": "..."} tried in that order — NVIDIA (free), then
+            OpenRouter's free variant (also $0, rate-limited), then OpenRouter
+            paid as the last resort.
         messages: List of message dicts with 'role' and 'content'
         timeout: Request timeout override. If None, uses PROVIDER_TIMEOUTS
             per provider (short for NVIDIA, longer for OpenRouter).
@@ -125,7 +132,7 @@ async def query_model(
 
     soft_failure = None  # an answer that arrived but was empty/cut off
     spent = {'prompt_tokens': 0, 'completion_tokens': 0, 'reasoning_tokens': 0}  # billed across retries
-    for provider in ("nvidia", "openrouter"):
+    for provider in PROVIDER_ORDER:
         model = model_spec.get(provider)
         if not model:
             continue
