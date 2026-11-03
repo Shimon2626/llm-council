@@ -645,9 +645,10 @@ if __name__ == "__main__":
     # data/conversations/*.json writes (every message) and reload on those.
     uvicorn.run(
         "backend.main:app",
-        # Hosted deployment: COUNCIL_HOST=127.0.0.1, COUNCIL_RELOAD=0 (nginx
-        # fronts it). Defaults keep local dev behavior unchanged.
-        host=os.getenv("COUNCIL_HOST", "0.0.0.0"),
+        # Loopback by default: the API has no auth, so binding all interfaces
+        # exposes it to the LAN (seen being probed 2026-11-03). Set
+        # COUNCIL_HOST=0.0.0.0 only deliberately. Hosted: COUNCIL_RELOAD=0 too.
+        host=os.getenv("COUNCIL_HOST", "127.0.0.1"),
         port=int(os.getenv("COUNCIL_PORT", "8001")),
         reload=os.getenv("COUNCIL_RELOAD", "1") == "1",
         reload_dirs=["backend"],
