@@ -9,6 +9,7 @@ silently under/over-estimate.
 import httpx
 from typing import Dict, List, Optional
 from .config import PROVIDERS
+from .web_search import WEB_MAX_RESULTS, WEB_COST_PER_RESULT_USD
 from .openrouter import DEFAULT_MAX_TOKENS, STAGE2_MAX_TOKENS, CHAIRMAN_MAX_TOKENS
 
 _pricing_cache: Optional[Dict[str, Dict[str, float]]] = None
@@ -65,7 +66,8 @@ def _priced_model(seat: Dict[str, str]) -> Optional[str]:
 async def estimate_cost(
     user_query: str,
     council_models: List[Dict[str, str]],
-    chairman_model: Dict[str, str]
+    chairman_model: Dict[str, str],
+    web_search: bool = False
 ) -> Dict:
     """
     Worst-case cost estimate for one council run, assuming every model uses
@@ -96,6 +98,12 @@ async def estimate_cost(
         if c:
             breakdown.append({"stage": 1, "provider": "openrouter", "model": model, "cost_usd": round(c, 4)})
             total += c
+
+    # Web search: billed per result, on every seat (NVIDIA seats switch to OpenRouter).
+    if web_search:
+        web_cost = num_seats * WEB_MAX_RESULTS * WEB_COST_PER_RESULT_USD
+        breakdown.append({"stage": 1, "provider": "openrouter", "model": "web search", "cost_usd": round(web_cost, 4)})
+        total += web_cost
 
     # Stage 2: each seat re-runs on a ranking prompt containing every stage1
     # response — worst case, every seat used its full stage1 budget.
