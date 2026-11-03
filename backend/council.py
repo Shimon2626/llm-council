@@ -20,7 +20,8 @@ async def stage1_collect_responses(
     user_query: str,
     council_models: Optional[List[Dict[str, str]]] = None,
     council_max_tokens: Optional[int] = None,
-    cost_log: Optional[List[Dict[str, Any]]] = None
+    cost_log: Optional[List[Dict[str, Any]]] = None,
+    web_search: bool = False
 ) -> List[Dict[str, Any]]:
     """
     Stage 1: Collect individual responses from all council models.
@@ -49,7 +50,7 @@ async def stage1_collect_responses(
     # single-provider pick still fails over on error, same as the default
     # council's dual-provider entries.
     effective_models = enrich_council_models(council_models) if council_models else COUNCIL_MODELS
-    responses = await query_models_parallel(effective_models, messages, max_tokens=council_max_tokens, reasoning_effort=STAGE1_REASONING_EFFORT)
+    responses = await query_models_parallel(effective_models, messages, max_tokens=council_max_tokens, reasoning_effort=STAGE1_REASONING_EFFORT, web_search=web_search)
 
     # Format results. EVERY seat gets a row, including failures: a seat that
     # returned nothing used to vanish (None) or pass as an empty "success",
@@ -194,7 +195,8 @@ async def stage3_synthesize_final(
     stage2_results: List[Dict[str, Any]],
     chairman_model: Optional[Dict[str, str]] = None,
     chairman_max_tokens: Optional[int] = None,
-    cost_log: Optional[List[Dict[str, Any]]] = None
+    cost_log: Optional[List[Dict[str, Any]]] = None,
+    web_search: bool = False
 ) -> Dict[str, Any]:
     """
     Stage 3: Chairman synthesizes final response.
@@ -227,7 +229,10 @@ async def stage3_synthesize_final(
     n_none = n_total - n_ok - n_cut
     health = (f"COUNCIL HEALTH: {n_total} seats asked; {n_ok} complete, {n_cut} cut off, {n_none} returned nothing. "
               f"Peer ranking covered only the {n_ok + n_cut} that returned text. "
-              "No seat had web access or could open links: no URL, figure or source in any response was checked.")
+              + ("Web search was ON for stage 1: seats received search results, but the council did not "
+                 "independently verify any cited URL or figure; attribute claims to the seat, not as confirmed."
+                 if web_search else
+                 "No seat had web access or could open links: no URL, figure or source in any response was checked."))
 
     stage2_text = "\n\n".join([
         f"Model: {result['model']}\nRanking: {result['ranking']}"
@@ -420,7 +425,8 @@ async def run_full_council(
     council_models: Optional[List[Dict[str, str]]] = None,
     chairman_model: Optional[Dict[str, str]] = None,
     council_max_tokens: Optional[int] = None,
-    chairman_max_tokens: Optional[int] = None
+    chairman_max_tokens: Optional[int] = None,
+    web_search: bool = False
 ) -> Tuple[List, List, Dict, Dict]:
     """
     Run the complete 3-stage council process.
@@ -440,7 +446,7 @@ async def run_full_council(
     cost_log = []
 
     # Stage 1: Collect individual responses
-    stage1_results = await stage1_collect_responses(user_query, council_models, council_max_tokens, cost_log)
+    stage1_results = await stage1_collect_responses(user_query, council_models, council_max_tokens, cost_log, web_search)
 
     # If no models responded successfully, return error
     if not any(r.get("status", "ok") in ("ok", "truncated") for r in stage1_results):
@@ -462,7 +468,8 @@ async def run_full_council(
         stage2_results,
         chairman_model,
         chairman_max_tokens,
-        cost_log
+        cost_log,
+        web_search
     )
 
     # Prepare metadata

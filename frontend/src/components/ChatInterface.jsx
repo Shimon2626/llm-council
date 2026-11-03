@@ -28,6 +28,7 @@ export default function ChatInterface({
   // literal "unlimited" — this is a per-request override of the finite cap.
   const [councilMaxTokens, setCouncilMaxTokens] = useState('');
   const [chairmanMaxTokens, setChairmanMaxTokens] = useState('');
+  const [webMode, setWebMode] = useState('auto'); // auto | on | off
   // Full live OpenRouter catalog (id strings only), fetched once — used only
   // to validate a free-typed custom slug, not rendered as a checkbox list.
   const [openRouterCatalog, setOpenRouterCatalog] = useState(null);
@@ -143,7 +144,7 @@ export default function ChatInterface({
     setCostEstimate(null);
     try {
       const content = buildMessageContent();
-      const result = await api.estimateCost(content, councilModelsPayload(), chairmanModelPayload());
+      const result = await api.estimateCost(content, councilModelsPayload(), chairmanModelPayload(), webMode);
       setCostEstimate(result);
     } catch (e) {
       console.error('Cost estimate failed:', e);
@@ -241,7 +242,8 @@ export default function ChatInterface({
         councilModelsPayload(),
         chairmanModelPayload(),
         toTokenOverride(councilMaxTokens),
-        toTokenOverride(chairmanMaxTokens)
+        toTokenOverride(chairmanMaxTokens),
+        webMode
       );
       setInput('');
       setAttachments([]);
@@ -470,13 +472,30 @@ export default function ChatInterface({
           </div>
 
           <div className="model-picker-group">
+            <div className="model-picker-group-label">Web search (council seats)</div>
+            <label className="model-picker-option model-picker-token-input">
+              Mode
+              <select value={webMode} onChange={(e) => setWebMode(e.target.value)}>
+                <option value="auto">Auto (links and live-data questions)</option>
+                <option value="on">Always on</option>
+                <option value="off">Off</option>
+              </select>
+            </label>
+            <div className="model-picker-token-note">
+              Search results are given to the seats in stage 1 only. It costs about
+              $0.02 per seat and moves NVIDIA seats to OpenRouter. Cited links are not
+              verified by the council. Use Estimate to see what Auto picks for your question.
+            </div>
+          </div>
+
+          <div className="model-picker-group">
             <div className="model-picker-group-label">Max tokens (blank = server default)</div>
             <label className="model-picker-option model-picker-token-input">
               Council seats
               <input
                 type="number"
                 min="1"
-                placeholder="8000"
+                placeholder="12000"
                 value={councilMaxTokens}
                 onChange={(e) => setCouncilMaxTokens(e.target.value)}
               />
@@ -702,6 +721,11 @@ export default function ChatInterface({
                     Estimated max cost: ${costEstimate.estimated_cost_usd.toFixed(4)}
                   </span>
                   <span className="cost-estimate-note">{costEstimate.note}</span>
+                  {costEstimate.web_search && (
+                    <span className="cost-estimate-note">
+                      Web search: {costEstimate.web_search.enabled ? 'ON' : 'off'} ({costEstimate.web_search.reason})
+                    </span>
+                  )}
                   {attachments.filter((a) => a.content !== null).map((a) => (
                     <span key={a.name} className="cost-estimate-note">
                       {a.name}: {a.kind === 'extracted' ? 'text extracted' : 'read as plain text'}, {a.content.length.toLocaleString()} chars
