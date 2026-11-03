@@ -34,6 +34,14 @@ def run(coro):
 
 
 class QueryModelTests(unittest.TestCase):
+    def test_picked_free_slug_falls_back_to_paid(self):
+        # both tiers share the openrouter key, so the fake is keyed by model
+        fake = FakeProvider({("openrouter_free", "g:free"): [RuntimeError("429")], ("openrouter", "g"): [reply("ok")]})
+        with mock.patch.object(openrouter, "_call_provider", fake):
+            r = run(openrouter.query_model("g:free", [{"role": "user", "content": "x"}]))
+        self.assertEqual(r["content"], "ok")
+        self.assertEqual([c[:2] for c in fake.calls], [("openrouter_free", "g:free"), ("openrouter", "g")])
+
     def q(self, script, spec, cap=100):
         fake = FakeProvider(script)
         with mock.patch.object(openrouter, "_call_provider", fake):

@@ -116,6 +116,26 @@ def is_empty(response: Optional[Dict[str, Any]]) -> bool:
     return response is None or not (response.get('content') or '').strip()
 
 
+FREE_FALLBACK_PAID = os.getenv("COUNCIL_FREE_FALLBACK_PAID", "1") == "1"
+
+
+def _with_paid_fallback(spec: ModelSpec) -> ModelSpec:
+    """A picked ":free" slug gets its paid twin as a last resort.
+
+    Free OpenRouter models are often rate limited (429); observed 2026-11-03: a
+    seat picked as gemma-4-31b-it:free errored and the council ran one seat
+    short, although the paid model answered instantly. Disable with
+    COUNCIL_FREE_FALLBACK_PAID=0 to guarantee a run never bills for a free pick.
+    """
+    if not FREE_FALLBACK_PAID or "openrouter_free" in spec:
+        return spec
+    slug = spec.get("openrouter") or ""
+    if not slug.endswith(":free"):
+        return spec
+    return {**{k: v for k, v in spec.items() if k != "openrouter"},
+            "openrouter_free": slug, "openrouter": slug[: -len(":free")]}
+
+
 async def query_model(
     model_spec: ModelSpec,
     messages: List[Dict[str, str]],
@@ -145,6 +165,7 @@ async def query_model(
     """
     if isinstance(model_spec, str):
         model_spec = {"openrouter": model_spec}
+    model_spec = _with_paid_fallback(model_spec)
 
     soft_failure = None  # an answer that arrived but was empty/cut off
     spent = {'prompt_tokens': 0, 'completion_tokens': 0, 'reasoning_tokens': 0}  # billed across retries
