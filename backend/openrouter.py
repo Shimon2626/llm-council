@@ -33,7 +33,12 @@ PROVIDER_TIMEOUTS = {
 # reply. These are generous fixed ceilings (raised 2026-07-19 from 2000/6000
 # after observed mid-sentence truncation), overridable per-deployment via
 # .env without touching code.
-DEFAULT_MAX_TOKENS = int(os.getenv("COUNCIL_MAX_TOKENS", "8000"))
+# max_tokens counts hidden reasoning AND the visible answer. Observed 2026-11-03:
+# visible answers ran ~3-4k tokens, but reasoning seats burned 8k-16k before
+# answering, so stage 1 gets 12000 (was 8000, which left two seats empty).
+# Stage 2 only ranks, so it needs far less (non-Kimi seats used 1.6k-5.7k).
+DEFAULT_MAX_TOKENS = int(os.getenv("COUNCIL_MAX_TOKENS", "12000"))
+STAGE2_MAX_TOKENS = int(os.getenv("COUNCIL_STAGE2_MAX_TOKENS", "6000"))
 # The Chairman synthesizes every stage1 response + every stage2 ranking into
 # one answer — that prompt is much larger than an individual council seat's,
 # so it needs more completion room or it truncates mid-sentence (observed

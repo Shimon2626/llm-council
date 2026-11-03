@@ -9,7 +9,7 @@ silently under/over-estimate.
 import httpx
 from typing import Dict, List, Optional
 from .config import PROVIDERS
-from .openrouter import DEFAULT_MAX_TOKENS, CHAIRMAN_MAX_TOKENS
+from .openrouter import DEFAULT_MAX_TOKENS, STAGE2_MAX_TOKENS, CHAIRMAN_MAX_TOKENS
 
 _pricing_cache: Optional[Dict[str, Dict[str, float]]] = None
 
@@ -104,7 +104,7 @@ async def estimate_cost(
         model = _priced_model(seat)
         if not model:
             continue
-        c = cost_for(model, stage2_input_estimate, DEFAULT_MAX_TOKENS)
+        c = cost_for(model, stage2_input_estimate, STAGE2_MAX_TOKENS)
         if c:
             breakdown.append({"stage": 2, "provider": "openrouter", "model": model, "cost_usd": round(c, 4)})
             total += c

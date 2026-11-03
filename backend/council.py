@@ -4,6 +4,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from .openrouter import (
     query_models_parallel, query_model, is_empty, CHAIRMAN_MAX_TOKENS,
     STAGE1_REASONING_EFFORT, STAGE2_REASONING_EFFORT, CHAIRMAN_REASONING_EFFORT,
+    STAGE2_MAX_TOKENS,
 )
 from .config import COUNCIL_MODELS, CHAIRMAN_MODEL, enrich_model_spec, enrich_council_models
 from . import pricing
@@ -162,7 +163,8 @@ Now provide your evaluation and ranking:"""
 
     # Get rankings from all council models in parallel (same fallback backfill as stage 1)
     effective_models = enrich_council_models(council_models) if council_models else COUNCIL_MODELS
-    responses = await query_models_parallel(effective_models, messages, max_tokens=council_max_tokens, reasoning_effort=STAGE2_REASONING_EFFORT)
+    responses = await query_models_parallel(effective_models, messages, max_tokens=council_max_tokens if council_max_tokens is not None else STAGE2_MAX_TOKENS,
+        reasoning_effort=STAGE2_REASONING_EFFORT)
 
     # Format results
     stage2_results = []
