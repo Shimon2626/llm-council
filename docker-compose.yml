@@ -1,0 +1,17 @@
+# Shared deployment. Only the web container is published, and only on loopback:
+# put an access gate (Cloudflare Access) in front before exposing it.
+services:
+  council-api:
+    build: { context: ., target: api }
+    restart: unless-stopped
+    env_file: ${COUNCIL_ENV_FILE:-.env}          # OPENROUTER_API_KEY, NVIDIA_API_KEY only
+    volumes:
+      - council-data:/app/data
+  council-web:
+    build: { context: ., target: web }
+    restart: unless-stopped
+    depends_on: [council-api]
+    ports:
+      - "127.0.0.1:${COUNCIL_WEB_PORT:-8088}:80"
+volumes:
+  council-data:
