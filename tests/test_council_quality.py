@@ -21,7 +21,7 @@ class FakeProvider:
     def __init__(self, script):
         self.script, self.calls = script, []
 
-    async def __call__(self, provider, model, messages, timeout, max_tokens):
+    async def __call__(self, provider, model, messages, timeout, max_tokens, reasoning_effort=""):
         self.calls.append((provider, model, max_tokens))
         item = self.script[(provider, model)].pop(0)
         if isinstance(item, Exception):
@@ -34,6 +34,14 @@ def run(coro):
 
 
 class QueryModelTests(unittest.TestCase):
+    def test_picked_free_slug_falls_back_to_paid(self):
+        # both tiers share the openrouter key, so the fake is keyed by model
+        fake = FakeProvider({("openrouter_free", "g:free"): [RuntimeError("429")], ("openrouter", "g"): [reply("ok")]})
+        with mock.patch.object(openrouter, "_call_provider", fake):
+            r = run(openrouter.query_model("g:free", [{"role": "user", "content": "x"}]))
+        self.assertEqual(r["content"], "ok")
+        self.assertEqual([c[:2] for c in fake.calls], [("openrouter_free", "g:free"), ("openrouter", "g")])
+
     def q(self, script, spec, cap=100):
         fake = FakeProvider(script)
         with mock.patch.object(openrouter, "_call_provider", fake):
@@ -72,8 +80,8 @@ class StageTests(unittest.TestCase):
     def test_stage2_excludes_empty_and_marks_truncated(self):
         seen = {}
 
-        async def fake_parallel(specs, messages, max_tokens=None):
-            seen["prompt"] = messages[0]["content"]
+        async def fake_parallel(specs, messages, max_tokens=None, reasoning_effort=""):
+            seen["prompt"] = messages[-1]["content"]
             return {"s1": {"content": "A is best.\n\nFINAL RANKING:\n1. Response A\n2. Response B",
                            "provider": "openrouter", "model": "s1", "usage": {}}}
 
@@ -93,7 +101,7 @@ class StageTests(unittest.TestCase):
         seen = {}
 
         async def fake_query(spec, messages, **kw):
-            seen["prompt"] = messages[0]["content"]
+            seen["prompt"] = messages[-1]["content"]
             return {"content": "synth", "provider": "openrouter", "model": "c", "usage": {}, "finish_reason": "stop"}
 
         stage1 = [resp("a", "x"), resp("b", "", "empty"), resp("c", "half", "truncated")]

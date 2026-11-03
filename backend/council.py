@@ -1,7 +1,11 @@
 """3-stage LLM Council orchestration."""
 
 from typing import List, Dict, Any, Optional, Tuple
-from .openrouter import query_models_parallel, query_model, is_empty, CHAIRMAN_MAX_TOKENS
+from .openrouter import (
+    query_models_parallel, query_model, is_empty, CHAIRMAN_MAX_TOKENS,
+    STAGE1_REASONING_EFFORT, STAGE2_REASONING_EFFORT, CHAIRMAN_REASONING_EFFORT,
+    STAGE2_MAX_TOKENS,
+)
 from .config import COUNCIL_MODELS, CHAIRMAN_MODEL, enrich_model_spec, enrich_council_models
 from . import pricing
 
@@ -45,7 +49,7 @@ async def stage1_collect_responses(
     # single-provider pick still fails over on error, same as the default
     # council's dual-provider entries.
     effective_models = enrich_council_models(council_models) if council_models else COUNCIL_MODELS
-    responses = await query_models_parallel(effective_models, messages, max_tokens=council_max_tokens)
+    responses = await query_models_parallel(effective_models, messages, max_tokens=council_max_tokens, reasoning_effort=STAGE1_REASONING_EFFORT)
 
     # Format results. EVERY seat gets a row, including failures: a seat that
     # returned nothing used to vanish (None) or pass as an empty "success",
@@ -159,7 +163,8 @@ Now provide your evaluation and ranking:"""
 
     # Get rankings from all council models in parallel (same fallback backfill as stage 1)
     effective_models = enrich_council_models(council_models) if council_models else COUNCIL_MODELS
-    responses = await query_models_parallel(effective_models, messages, max_tokens=council_max_tokens)
+    responses = await query_models_parallel(effective_models, messages, max_tokens=council_max_tokens if council_max_tokens is not None else STAGE2_MAX_TOKENS,
+        reasoning_effort=STAGE2_REASONING_EFFORT)
 
     # Format results
     stage2_results = []
@@ -265,7 +270,7 @@ Provide a clear, well-reasoned final answer that represents the council's collec
     # chairman pick still fails over to its verified equivalent on error.
     effective_chairman_max_tokens = chairman_max_tokens if chairman_max_tokens is not None else CHAIRMAN_MAX_TOKENS
     effective_chairman = enrich_model_spec(chairman_model) if chairman_model else CHAIRMAN_MODEL
-    response = await query_model(effective_chairman, messages, max_tokens=effective_chairman_max_tokens)
+    response = await query_model(effective_chairman, messages, max_tokens=effective_chairman_max_tokens, reasoning_effort=CHAIRMAN_REASONING_EFFORT)
 
     if response is None or is_empty(response):
         # Fallback if chairman fails (error OR blank reply)

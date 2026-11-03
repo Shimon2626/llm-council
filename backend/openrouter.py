@@ -33,7 +33,12 @@ PROVIDER_TIMEOUTS = {
 # reply. These are generous fixed ceilings (raised 2026-07-19 from 2000/6000
 # after observed mid-sentence truncation), overridable per-deployment via
 # .env without touching code.
-DEFAULT_MAX_TOKENS = int(os.getenv("COUNCIL_MAX_TOKENS", "8000"))
+# max_tokens counts hidden reasoning AND the visible answer. Observed 2026-11-03:
+# visible answers ran ~3-4k tokens, but reasoning seats burned 8k-16k before
+# answering, so stage 1 gets 12000 (was 8000, which left two seats empty).
+# Stage 2 only ranks, so it needs far less (non-Kimi seats used 1.6k-5.7k).
+DEFAULT_MAX_TOKENS = int(os.getenv("COUNCIL_MAX_TOKENS", "12000"))
+STAGE2_MAX_TOKENS = int(os.getenv("COUNCIL_STAGE2_MAX_TOKENS", "6000"))
 # The Chairman synthesizes every stage1 response + every stage2 ranking into
 # one answer — that prompt is much larger than an individual council seat's,
 # so it needs more completion room or it truncates mid-sentence (observed
@@ -45,6 +50,13 @@ CHAIRMAN_MAX_TOKENS = int(os.getenv("CHAIRMAN_MAX_TOKENS", "16000"))
 # above this ceiling (a cap far past a model's real window risks a 400, which
 # then just falls through to the next provider like any other error).
 RETRY_MAX_TOKENS_CEILING = int(os.getenv("COUNCIL_RETRY_MAX_TOKENS_CEILING", "32000"))
+# Reasoning effort sent to OpenRouter ("low" | "medium" | "high"; "" = provider
+# default). Stage 2 only ranks answers, so hidden reasoning there is mostly
+# wasted time and money (observed 2026-11-03: 21k completion tokens for one
+# ranking). Models without reasoning support ignore the field.
+STAGE1_REASONING_EFFORT = os.getenv("COUNCIL_STAGE1_REASONING", "medium")
+STAGE2_REASONING_EFFORT = os.getenv("COUNCIL_STAGE2_REASONING", "low")
+CHAIRMAN_REASONING_EFFORT = os.getenv("CHAIRMAN_REASONING", "medium")
 
 
 async def _call_provider(
@@ -52,7 +64,8 @@ async def _call_provider(
     model: str,
     messages: List[Dict[str, str]],
     timeout: float,
-    max_tokens: int
+    max_tokens: int,
+    reasoning_effort: str = ""
 ) -> Dict[str, Any]:
     """Make one call against a named provider. Raises on any failure."""
     cfg = PROVIDERS[PROVIDER_ALIASES.get(provider, provider)]
@@ -65,6 +78,8 @@ async def _call_provider(
         "messages": messages,
         "max_tokens": max_tokens,
     }
+    if reasoning_effort and PROVIDER_ALIASES.get(provider, provider) == "openrouter":
+        payload["reasoning"] = {"effort": reasoning_effort}
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(cfg['api_url'], headers=headers, json=payload)
@@ -101,11 +116,32 @@ def is_empty(response: Optional[Dict[str, Any]]) -> bool:
     return response is None or not (response.get('content') or '').strip()
 
 
+FREE_FALLBACK_PAID = os.getenv("COUNCIL_FREE_FALLBACK_PAID", "1") == "1"
+
+
+def _with_paid_fallback(spec: ModelSpec) -> ModelSpec:
+    """A picked ":free" slug gets its paid twin as a last resort.
+
+    Free OpenRouter models are often rate limited (429); observed 2026-11-03: a
+    seat picked as gemma-4-31b-it:free errored and the council ran one seat
+    short, although the paid model answered instantly. Disable with
+    COUNCIL_FREE_FALLBACK_PAID=0 to guarantee a run never bills for a free pick.
+    """
+    if not FREE_FALLBACK_PAID or "openrouter_free" in spec:
+        return spec
+    slug = spec.get("openrouter") or ""
+    if not slug.endswith(":free"):
+        return spec
+    return {**{k: v for k, v in spec.items() if k != "openrouter"},
+            "openrouter_free": slug, "openrouter": slug[: -len(":free")]}
+
+
 async def query_model(
     model_spec: ModelSpec,
     messages: List[Dict[str, str]],
     timeout: Optional[float] = None,
-    max_tokens: int = DEFAULT_MAX_TOKENS
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    reasoning_effort: str = ""
 ) -> Optional[Dict[str, Any]]:
     """
     Query one council seat, trying providers in order until one succeeds.
@@ -129,6 +165,7 @@ async def query_model(
     """
     if isinstance(model_spec, str):
         model_spec = {"openrouter": model_spec}
+    model_spec = _with_paid_fallback(model_spec)
 
     soft_failure = None  # an answer that arrived but was empty/cut off
     spent = {'prompt_tokens': 0, 'completion_tokens': 0, 'reasoning_tokens': 0}  # billed across retries
@@ -140,7 +177,7 @@ async def query_model(
         cap = max_tokens
         for attempt in (1, 2):
             try:
-                result = await _call_provider(provider, model, messages, effective_timeout, cap)
+                result = await _call_provider(provider, model, messages, effective_timeout, cap, reasoning_effort)
             except Exception as e:
                 # httpx timeout/connection errors often stringify to "" — fall
                 # back to the exception class name so the log line is never blank.
@@ -178,7 +215,8 @@ async def query_model(
 async def query_models_parallel(
     model_specs: List[ModelSpec],
     messages: List[Dict[str, str]],
-    max_tokens: Optional[int] = None
+    max_tokens: Optional[int] = None,
+    reasoning_effort: str = ""
 ) -> Dict[str, Optional[Dict[str, Any]]]:
     """
     Query multiple council seats in parallel, each with its own fallback chain.
@@ -203,7 +241,7 @@ async def query_models_parallel(
 
     labels = [seat_label(spec) for spec in model_specs]
     effective_max_tokens = max_tokens if max_tokens is not None else DEFAULT_MAX_TOKENS
-    tasks = [query_model(spec, messages, max_tokens=effective_max_tokens) for spec in model_specs]
+    tasks = [query_model(spec, messages, max_tokens=effective_max_tokens, reasoning_effort=reasoning_effort) for spec in model_specs]
 
     responses = await asyncio.gather(*tasks)
 
