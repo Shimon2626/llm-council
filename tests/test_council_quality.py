@@ -21,7 +21,7 @@ class FakeProvider:
     def __init__(self, script):
         self.script, self.calls = script, []
 
-    async def __call__(self, provider, model, messages, timeout, max_tokens, reasoning_effort=""):
+    async def __call__(self, provider, model, messages, timeout, max_tokens, reasoning_effort="", web_search=False):
         self.calls.append((provider, model, max_tokens))
         item = self.script[(provider, model)].pop(0)
         if isinstance(item, Exception):
@@ -80,7 +80,7 @@ class StageTests(unittest.TestCase):
     def test_stage2_excludes_empty_and_marks_truncated(self):
         seen = {}
 
-        async def fake_parallel(specs, messages, max_tokens=None, reasoning_effort=""):
+        async def fake_parallel(specs, messages, max_tokens=None, reasoning_effort="", web_search=False):
             seen["prompt"] = messages[-1]["content"]
             return {"s1": {"content": "A is best.\n\nFINAL RANKING:\n1. Response A\n2. Response B",
                            "provider": "openrouter", "model": "s1", "usage": {}}}

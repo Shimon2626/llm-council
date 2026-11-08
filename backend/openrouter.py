@@ -8,6 +8,7 @@ import os
 import httpx
 from typing import List, Dict, Any, Optional, Union
 from .config import PROVIDERS
+from .web_search import WEB_MAX_RESULTS
 
 ModelSpec = Union[str, Dict[str, str]]
 
@@ -65,7 +66,8 @@ async def _call_provider(
     messages: List[Dict[str, str]],
     timeout: float,
     max_tokens: int,
-    reasoning_effort: str = ""
+    reasoning_effort: str = "",
+    web_search: bool = False
 ) -> Dict[str, Any]:
     """Make one call against a named provider. Raises on any failure."""
     cfg = PROVIDERS[PROVIDER_ALIASES.get(provider, provider)]
@@ -80,6 +82,8 @@ async def _call_provider(
     }
     if reasoning_effort and PROVIDER_ALIASES.get(provider, provider) == "openrouter":
         payload["reasoning"] = {"effort": reasoning_effort}
+    if web_search and PROVIDER_ALIASES.get(provider, provider) == "openrouter":
+        payload["plugins"] = [{"id": "web", "max_results": WEB_MAX_RESULTS}]
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(cfg['api_url'], headers=headers, json=payload)
@@ -141,7 +145,8 @@ async def query_model(
     messages: List[Dict[str, str]],
     timeout: Optional[float] = None,
     max_tokens: int = DEFAULT_MAX_TOKENS,
-    reasoning_effort: str = ""
+    reasoning_effort: str = "",
+    web_search: bool = False
 ) -> Optional[Dict[str, Any]]:
     """
     Query one council seat, trying providers in order until one succeeds.
@@ -173,11 +178,13 @@ async def query_model(
         model = model_spec.get(provider)
         if not model:
             continue
+        if web_search and provider == "nvidia":
+            continue  # NVIDIA has no search; the seat's OpenRouter entry answers instead
         effective_timeout = timeout if timeout is not None else PROVIDER_TIMEOUTS[provider]
         cap = max_tokens
         for attempt in (1, 2):
             try:
-                result = await _call_provider(provider, model, messages, effective_timeout, cap, reasoning_effort)
+                result = await _call_provider(provider, model, messages, effective_timeout, cap, reasoning_effort, web_search)
             except Exception as e:
                 # httpx timeout/connection errors often stringify to "" — fall
                 # back to the exception class name so the log line is never blank.
@@ -216,7 +223,8 @@ async def query_models_parallel(
     model_specs: List[ModelSpec],
     messages: List[Dict[str, str]],
     max_tokens: Optional[int] = None,
-    reasoning_effort: str = ""
+    reasoning_effort: str = "",
+    web_search: bool = False
 ) -> Dict[str, Optional[Dict[str, Any]]]:
     """
     Query multiple council seats in parallel, each with its own fallback chain.
@@ -241,7 +249,7 @@ async def query_models_parallel(
 
     labels = [seat_label(spec) for spec in model_specs]
     effective_max_tokens = max_tokens if max_tokens is not None else DEFAULT_MAX_TOKENS
-    tasks = [query_model(spec, messages, max_tokens=effective_max_tokens, reasoning_effort=reasoning_effort) for spec in model_specs]
+    tasks = [query_model(spec, messages, max_tokens=effective_max_tokens, reasoning_effort=reasoning_effort, web_search=web_search) for spec in model_specs]
 
     responses = await asyncio.gather(*tasks)
 

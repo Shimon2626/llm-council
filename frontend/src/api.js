@@ -74,7 +74,7 @@ export const api = {
   /**
    * Estimate the worst-case USD cost of a council run before sending it.
    */
-  async estimateCost(content, councilModels, chairmanModel) {
+  async estimateCost(content, councilModels, chairmanModel, webSearch) {
     const response = await fetch(`${API_BASE}/api/estimate-cost`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -82,6 +82,7 @@ export const api = {
         content,
         council_models: councilModels,
         chairman_model: chairmanModel,
+        web_search: webSearch,
       }),
     });
     if (!response.ok) {
@@ -201,7 +202,7 @@ export const api = {
    * @param {function} onEvent - Callback function for each event: (eventType, data) => void
    * @returns {Promise<void>}
    */
-  async sendMessageStream(conversationId, content, onEvent, councilModels, chairmanModel, councilMaxTokens, chairmanMaxTokens, signal) {
+  async sendMessageStream(conversationId, content, onEvent, councilModels, chairmanModel, councilMaxTokens, chairmanMaxTokens, signal, webSearch) {
     const response = await fetch(
       `${API_BASE}/api/conversations/${conversationId}/message/stream`,
       {
@@ -215,6 +216,7 @@ export const api = {
           chairman_model: chairmanModel,
           council_max_tokens: councilMaxTokens,
           chairman_max_tokens: chairmanMaxTokens,
+          web_search: webSearch,
         }),
         signal,
       }

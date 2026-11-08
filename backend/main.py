@@ -14,6 +14,7 @@ import re
 import zipfile
 import xml.etree.ElementTree as ET
 
+from .web_search import resolve_web_search
 from . import storage
 from . import config
 from . import pricing
@@ -144,6 +145,8 @@ class SendMessageRequest(_ContentRequest):
     # .env-configurable). No provider accepts a literal "unlimited" value.
     council_max_tokens: Optional[int] = None
     chairman_max_tokens: Optional[int] = None
+    # "auto" (default), "on" or "off" - see backend/web_search.py
+    web_search: Optional[str] = None
 
 
 class EstimateCostRequest(_ContentRequest):
@@ -151,6 +154,7 @@ class EstimateCostRequest(_ContentRequest):
 
     council_models: Optional[List[Dict[str, str]]] = None
     chairman_model: Optional[Dict[str, str]] = None
+    web_search: Optional[str] = None
 
 
 class SaveApiKeysRequest(BaseModel):
@@ -451,7 +455,10 @@ async def estimate_cost(request: EstimateCostRequest):
     council, before actually sending it. NVIDIA seats are $0."""
     council_models = request.council_models or config.COUNCIL_MODELS
     chairman_model = request.chairman_model or config.CHAIRMAN_MODEL
-    return await pricing.estimate_cost(request.content, council_models, chairman_model)
+    web = resolve_web_search(request.web_search, request.content)
+    result = await pricing.estimate_cost(request.content, council_models, chairman_model, web["enabled"])
+    result["web_search"] = web
+    return result
 
 
 @app.get("/api/conversations", response_model=List[ConversationMetadata])
@@ -502,7 +509,8 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
     # Run the 3-stage council process
     stage1_results, stage2_results, stage3_result, metadata = await run_full_council(
         request.content, request.council_models, request.chairman_model,
-        request.council_max_tokens, request.chairman_max_tokens
+        request.council_max_tokens, request.chairman_max_tokens,
+        resolve_web_search(request.web_search, request.content)["enabled"]
     )
 
     # Add assistant message with all stages
@@ -552,11 +560,12 @@ async def send_message_stream(conversation_id: str, body: SendMessageRequest, ht
             # stages, so the actual (not estimated) cost can be computed the
             # moment stage 3 finishes — see the cost_complete event below.
             cost_log = []
+            web = resolve_web_search(body.web_search, body.content)
 
             # Stage 1: Collect responses
-            yield f"data: {json.dumps({'type': 'stage1_start'})}\n\n"
+            yield f"data: {json.dumps({'type': 'stage1_start', 'web_search': web})}\n\n"
             stage1_results = None
-            async for item in _run_with_heartbeat(stage1_collect_responses(body.content, body.council_models, body.council_max_tokens, cost_log), http_request):
+            async for item in _run_with_heartbeat(stage1_collect_responses(body.content, body.council_models, body.council_max_tokens, cost_log, web["enabled"]), http_request):
                 if item is None:
                     yield ": heartbeat\n\n"
                 else:
@@ -578,7 +587,7 @@ async def send_message_stream(conversation_id: str, body: SendMessageRequest, ht
             # Stage 3: Synthesize final answer
             yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
             stage3_result = None
-            async for item in _run_with_heartbeat(stage3_synthesize_final(body.content, stage1_results, stage2_results, body.chairman_model, body.chairman_max_tokens, cost_log), http_request):
+            async for item in _run_with_heartbeat(stage3_synthesize_final(body.content, stage1_results, stage2_results, body.chairman_model, body.chairman_max_tokens, cost_log, web["enabled"]), http_request):
                 if item is None:
                     yield ": heartbeat\n\n"
                 else:
