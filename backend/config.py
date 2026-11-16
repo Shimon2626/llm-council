@@ -170,6 +170,57 @@ def enrich_council_models(council_models):
     ]
 
 
+def seat_base_model(spec):
+    """Identity of a seat's underlying model, ignoring provider and ":free".
+
+    "openrouter/nvidia/nemotron-3-ultra-550b-a55b" and its ":free" twin, or the
+    NVIDIA copy of it, are the same model: seating both counts one opinion twice.
+    """
+    if isinstance(spec, str):
+        slugs = [spec]
+    else:
+        slugs = [spec.get(k) for k in ("nvidia", "openrouter_free", "openrouter") if spec.get(k)]
+    if not slugs:
+        return ""
+    slug = slugs[0].lower()
+    return slug[: -len(":free")] if slug.endswith(":free") else slug
+
+
+def dedupe_seats(specs):
+    """Split a seat list into (kept, dropped) by base model; first seat wins.
+
+    `dropped` holds (spec, kept_base_model) pairs so the run can say what was
+    removed instead of silently shrinking the council.
+    """
+    kept, dropped, seen = [], [], set()
+    for spec in specs or []:
+        base = seat_base_model(spec)
+        if base and base in seen:
+            dropped.append((spec, base))
+            continue
+        seen.add(base)
+        kept.append(spec)
+    return kept, dropped
+
+
+# Reserve seats: used only to replace a seat that returned nothing, so the
+# council stays at full strength. All are paid OpenRouter slugs taken from
+# AVAILABLE_MODELS above. Override with COUNCIL_RESERVE_MODELS (comma list,
+# empty string = no reserves).
+_DEFAULT_RESERVES = (
+    "deepseek/deepseek-v4-pro-0813",
+    "mistralai/mistral-medium-3-5",
+    "qwen/qwen3.8-max-prime",
+    "x-ai/grok-4.7",
+)
+
+
+def reserve_seats():
+    raw = os.getenv("COUNCIL_RESERVE_MODELS")
+    slugs = _DEFAULT_RESERVES if raw is None else tuple(s.strip() for s in raw.split(",") if s.strip())
+    return [{"openrouter": s} for s in slugs]
+
+
 # =============================================================================
 # Selectable models for the per-query model picker (frontend). Each entry is
 # a single-provider choice from the picker's perspective — but as of 2026-07-19
