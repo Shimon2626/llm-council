@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
+import { typedPrompt, attachmentPreviewBlocks, attachmentTable, healthLines, seatTable } from '../reportText';
 import ReactMarkdown from 'react-markdown';
 import Stage1 from './Stage1';
 import Stage2 from './Stage2';
@@ -318,28 +319,30 @@ export default function ChatInterface({
     const lines = [`# LLM Council Report`, ``, `**Date:** ${new Date().toISOString()}`, ``];
 
     if (userQuery) {
-      // Show only a preview of each attached file so a bad extraction is
-      // visible at a glance without burying the report in the full file.
-      const trimmed = userQuery.replace(
-        /\*\*Attached file: ([^\n]*)\*\*\n```\n([\s\S]*?)\n```/g,
-        (_, name, body) =>
-          `**Attached file: ${name}** (${body.length.toLocaleString()} chars; first 600 shown)\n\`\`\`\n${body.slice(0, 600)}${body.length > 600 ? '\n…' : ''}\n\`\`\``
-      );
-      lines.push(`## Query`, ``, trimmed, ``);
+      // The typed prompt is printed in full. Attachments are listed with their
+      // full extracted length and SHA-256; the text below each is only a preview.
+      const typed = msg.metadata?.run_record?.typed_prompt ?? typedPrompt(userQuery);
+      lines.push(`## Query (typed prompt, full)`, ``, typed || `_empty: nothing was typed; the seats received only the attached file(s)_`, ``);
+      lines.push(`## Attachments (full extracted text, by length and hash)`, ``);
+      lines.push(...(msg.metadata?.run_record ? attachmentTable(msg.metadata.run_record) : [`_not recorded for this conversation_`, ``]));
+      lines.push(`## Attachment previews`, ``, attachmentPreviewBlocks(userQuery, 600) || `_none_`, ``);
     }
 
     const s1 = msg.stage1 || [];
-    const okN = s1.filter((r) => (r.status || 'ok') === 'ok').length;
-    const cutN = s1.filter((r) => r.status === 'truncated').length;
+    lines.push(`## Council health`, ``, ...healthLines(s1).map((l, i) => (i === 0 ? l : l)), ``);
     lines.push(
-      `## Council health`, ``,
-      `${s1.length} seats asked: ${okN} complete, ${cutN} cut off, ${s1.length - okN - cutN} returned nothing. Only complete answers count as full reviews.`,
-      `No seat had web access: no source or figure was checked.`, ``
+      (msg.metadata?.run_record?.web_search ?? msg.web_search)?.enabled
+        ? `Web search was ON for stage 1; cited URLs and figures were not independently verified.`
+        : `No seat had web access: no source or figure was checked.`,
+      ``
     );
+    lines.push(`## Seats run`, ``, ...seatTable(s1));
     lines.push(`## Stage 1 — Individual Responses`, ``);
     if (s1.length === 0) lines.push(`_No Stage 1 data was available to this export._`, ``);
     s1.forEach((r) => {
-      const st = r.status && r.status !== 'ok' ? ` — ${r.status.toUpperCase()} (finish_reason=${r.finish_reason}, ${r.completion_tokens} completion tokens)` : '';
+      const st = r.status && r.status !== 'ok'
+        ? ` — ${r.status.toUpperCase()} (finish_reason=${r.finish_reason}, ${r.completion_tokens} completion tokens${r.error_detail ? `; ${r.error_detail}` : ''})`
+        : '';
       lines.push(`### ${r.model}${st}`, ``, r.response || '_(no text returned)_', ``);
     });
 
@@ -388,9 +391,9 @@ export default function ChatInterface({
     } else if (aggregate.length === 0) {
       lines.push(`_none: no parsable rankings to aggregate_`, ``);
     } else {
-      lines.push(`| Model | Average Rank | Rankings Count |`, `|---|---|---|`);
+      lines.push(`| Model | Average rank (own vote excluded) | Average rank (all votes) | Votes counted | Self-votes |`, `|---|---|---|---|---|`);
       aggregate.forEach((a) => {
-        lines.push(`| ${cell(a.model)} | ${a.average_rank} | ${a.rankings_count} |`);
+        lines.push(`| ${cell(a.model)} | ${a.average_rank ?? 'n/a'} | ${a.average_rank_all_votes ?? a.average_rank} | ${a.rankings_count} | ${a.self_votes ?? 'not recorded'} |`);
       });
       lines.push(``);
     }

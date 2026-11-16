@@ -19,7 +19,7 @@ from . import storage
 from . import config
 from . import pricing
 from . import openrouter_catalog
-from .preflight import build_preflight, missing_message
+from .preflight import build_preflight, missing_message, run_record
 from .council import run_full_council, generate_conversation_title, stage1_collect_responses, stage2_collect_rankings, stage3_synthesize_final, calculate_aggregate_rankings
 
 # Zip-upload extraction limits (backend/main.py's /api/extract-zip).
@@ -541,6 +541,8 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
         resolve_web_search(request.web_search, request.content)["enabled"]
     )
 
+    metadata["run_record"] = run_record(request.content, resolve_web_search(request.web_search, request.content))
+
     # Add assistant message with all stages
     storage.add_assistant_message(
         conversation_id,
@@ -612,7 +614,7 @@ async def send_message_stream(conversation_id: str, body: SendMessageRequest, ht
                     stage2_result_pair = item
             stage2_results, label_to_model = stage2_result_pair
             aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
-            yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}})}\n\n"
+            yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings, 'run_record': run_record(body.content, web)}})}\n\n"
 
             # Stage 3: Synthesize final answer
             yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
@@ -647,7 +649,7 @@ async def send_message_stream(conversation_id: str, body: SendMessageRequest, ht
                 stage2_results,
                 stage3_result,
                 actual_cost,
-                {"label_to_model": label_to_model, "aggregate_rankings": aggregate_rankings}
+                {"label_to_model": label_to_model, "aggregate_rankings": aggregate_rankings, "run_record": run_record(body.content, web)}
             )
 
             # Send completion event

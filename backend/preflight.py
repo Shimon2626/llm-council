@@ -107,3 +107,15 @@ def build_preflight(content: str, client_files: Optional[List[Dict[str, Any]]] =
 def missing_message(result: Dict[str, Any]) -> str:
     names = "; ".join(f"{m['name']} ({m['why']})" for m in result["missing"])
     return f"The prompt's MANIFEST lists files that are not attached, so no seat was asked: {names}. Attach them and send again."
+
+
+def run_record(content: str, web_search: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """What the council was actually given, saved with the run: the full typed
+    prompt and, per attachment, its full extracted length and SHA-256 (the text
+    itself stays in the conversation's user message)."""
+    typed, blocks = split_query(content)
+    return {
+        "web_search": web_search,
+        "typed_prompt": typed.strip(),
+        "attachments": [{"name": b["name"], "text_chars": len(b["text"]), "text_sha256": sha256_text(b["text"])} for b in blocks],
+    }
