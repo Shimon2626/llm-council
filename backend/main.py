@@ -19,6 +19,7 @@ from . import storage
 from . import config
 from . import pricing
 from . import openrouter_catalog
+from .preflight import build_preflight, missing_message
 from .council import run_full_council, generate_conversation_title, stage1_collect_responses, stage2_collect_rankings, stage3_synthesize_final, calculate_aggregate_rankings
 
 # Zip-upload extraction limits (backend/main.py's /api/extract-zip).
@@ -155,6 +156,13 @@ class EstimateCostRequest(_ContentRequest):
     council_models: Optional[List[Dict[str, str]]] = None
     chairman_model: Optional[Dict[str, str]] = None
     web_search: Optional[str] = None
+
+
+class PreflightRequest(_ContentRequest):
+    """The message as the UI would send it, plus what only the browser knows
+    about each file it was given (size, SHA-256, and files it refused)."""
+
+    files: Optional[List[Dict[str, Any]]] = None
 
 
 class SaveApiKeysRequest(BaseModel):
@@ -449,6 +457,24 @@ async def list_openrouter_catalog():
     return {"models": ids}
 
 
+@app.post("/api/preflight")
+async def preflight(request: PreflightRequest):
+    """Table of every attachment (name, bytes, SHA-256, accepted/skipped and why)
+    and the files the prompt's MANIFEST names that are not attached."""
+    result = build_preflight(request.content, request.files)
+    if result["missing"]:
+        result["message"] = missing_message(result)
+    return result
+
+
+def _refuse_if_manifest_file_missing(content: str) -> None:
+    """Stop before any seat is called when the prompt's MANIFEST names a file
+    that is not attached (a silent gap made 7 of 8 seats review without it)."""
+    result = build_preflight(content)
+    if result["missing"]:
+        raise HTTPException(status_code=422, detail=missing_message(result))
+
+
 @app.post("/api/estimate-cost")
 async def estimate_cost(request: EstimateCostRequest):
     """Estimate the worst-case USD cost of running this query through the
@@ -494,6 +520,8 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
     conversation = storage.get_conversation(conversation_id)
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
+
+    _refuse_if_manifest_file_missing(request.content)
 
     # Check if this is the first message
     is_first_message = len(conversation["messages"]) == 0
@@ -542,6 +570,8 @@ async def send_message_stream(conversation_id: str, body: SendMessageRequest, ht
     conversation = storage.get_conversation(conversation_id)
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
+
+    _refuse_if_manifest_file_missing(body.content)
 
     # Check if this is the first message
     is_first_message = len(conversation["messages"]) == 0

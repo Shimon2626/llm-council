@@ -19,6 +19,12 @@ export default function ChatInterface({
 }) {
   const [input, setInput] = useState('');
   const [attachments, setAttachments] = useState([]);
+  // What the browser knows about each file it was given (size, SHA-256) and the
+  // files it refused, with the reason: shown in the preflight table so a skipped
+  // attachment is never silent. See backend/preflight.py.
+  const fileMetaRef = useRef({});
+  const [skippedFiles, setSkippedFiles] = useState([]);
+  const [preflight, setPreflight] = useState(null);
   const [availableModels, setAvailableModels] = useState({ nvidia: [], openrouter: [] });
   const [showModelPicker, setShowModelPicker] = useState(false);
   const [selectedSeats, setSelectedSeats] = useState([]); // [] means "use backend default council"
@@ -143,6 +149,7 @@ export default function ChatInterface({
     setEstimating(true);
     setCostEstimate(null);
     try {
+      await runPreflight();
       const content = buildMessageContent();
       const result = await api.estimateCost(content, councilModelsPayload(), chairmanModelPayload(), webMode);
       setCostEstimate(result);
@@ -154,9 +161,30 @@ export default function ChatInterface({
     }
   };
 
+  const sha256Hex = async (file) => {
+    try {
+      const digest = await crypto.subtle.digest('SHA-256', await file.arrayBuffer());
+      return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('');
+    } catch {
+      return null; // crypto.subtle needs a secure context; the server still hashes the extracted text
+    }
+  };
+
+  const recordSkipped = (file, reason) => {
+    setSkippedFiles((prev) => [...prev.filter((s) => s.name !== file.name), { name: file.name, bytes: file.size, status: 'skipped', reason }]);
+  };
+
   const handleFileChange = (e) => {
     const files = Array.from(e.target.files);
     files.forEach((file) => {
+      if (attachments.some((a) => a.name === file.name)) {
+        recordSkipped(file, 'a file with the same name is already attached');
+        alert(`${file.name} is already attached; the second copy was skipped.`);
+        return;
+      }
+      fileMetaRef.current[file.name] = { name: file.name, bytes: file.size, sha256: null };
+      sha256Hex(file).then((h) => { if (fileMetaRef.current[file.name]) fileMetaRef.current[file.name].sha256 = h; });
+      setSkippedFiles((prev) => prev.filter((s) => s.name !== file.name));
       const lowerName = file.name.toLowerCase();
       if (lowerName.endsWith('.zip')) {
         uploadExtracted(file, api.extractZip, zipHeader(file));
@@ -177,11 +205,13 @@ export default function ChatInterface({
         const text = String(reader.result);
         const sample = text.slice(0, 4000);
         if (sample.includes('\u0000') || (sample.match(/\uFFFD/g) || []).length > 5) {
+          recordSkipped(file, 'looks like a binary file; cannot be attached as text');
           alert(`${file.name} looks like a binary file and can't be attached as text.`);
           return;
         }
         setAttachments((prev) => [...prev, { name: file.name, content: text, kind: 'text' }]);
       };
+      reader.onerror = () => recordSkipped(file, 'the browser could not read the file');
       reader.readAsText(file);
     });
     e.target.value = ''; // allow re-selecting the same file
@@ -203,6 +233,7 @@ export default function ChatInterface({
     } catch (error) {
       console.error(`Failed to extract ${file.name}:`, error);
       setAttachments((prev) => prev.filter((a) => a.name !== file.name));
+      recordSkipped(file, `extraction failed: ${error.message}`);
       alert(`Could not extract ${file.name}: ${error.message}`);
     }
   };
@@ -234,9 +265,30 @@ export default function ChatInterface({
     return `${input}\n\n${attachmentBlocks}`;
   };
 
-  const handleSubmit = (e) => {
+  // Table of every attachment + MANIFEST check. Returns the server's result, or
+  // null if the check itself could not run (the server repeats the MANIFEST
+  // check on send, so a failure here does not let a gap through).
+  const runPreflight = async () => {
+    const files = [
+      ...Object.values(fileMetaRef.current).filter((f) => !skippedFiles.some((s) => s.name === f.name)),
+      ...skippedFiles,
+    ];
+    try {
+      const result = await api.preflight(buildMessageContent(), files);
+      setPreflight(result);
+      return result;
+    } catch (error) {
+      console.error('Preflight failed:', error);
+      setPreflight({ error: error.message });
+      return null;
+    }
+  };
+
+  const handleSubmit = async (e) => {
     e.preventDefault();
     if ((input.trim() || attachments.length > 0) && !isLoading && !attachmentsUploading) {
+      const check = await runPreflight();
+      if (check && !check.ok) return; // MANIFEST names a file that is not attached: stop, say which
       onSendMessage(
         buildMessageContent(),
         councilModelsPayload(),
@@ -247,6 +299,9 @@ export default function ChatInterface({
       );
       setInput('');
       setAttachments([]);
+      setSkippedFiles([]);
+      setPreflight(null);
+      fileMetaRef.current = {};
       setCostEstimate(null);
     }
   };
@@ -665,6 +720,40 @@ export default function ChatInterface({
                   </button>
                 </span>
               ))}
+            </div>
+          )}
+          {preflight && (
+            <div className="preflight-panel">
+              {preflight.error ? (
+                <div className="cost-estimate-error">Preflight could not run: {preflight.error}</div>
+              ) : (
+                <>
+                  {!preflight.ok && <div className="cost-estimate-error">{preflight.message}</div>}
+                  {preflight.warnings?.map((w) => (
+                    <div key={w} className="cost-estimate-note">{w}</div>
+                  ))}
+                  <table className="preflight-table">
+                    <thead>
+                      <tr><th>File</th><th>Bytes</th><th>SHA-256</th><th>Text chars</th><th>Status</th><th>Reason</th></tr>
+                    </thead>
+                    <tbody>
+                      {preflight.rows.map((r) => (
+                        <tr key={r.name}>
+                          <td>{r.name}</td>
+                          <td>{r.bytes ?? '?'}</td>
+                          <td title={r.sha256 || r.text_sha256 || ''}>{(r.sha256 || r.text_sha256 || '').slice(0, 12) || '?'}…</td>
+                          <td>{r.text_chars ?? '-'}</td>
+                          <td>{r.status}</td>
+                          <td>{r.reason}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {preflight.typed_prompt_chars === 0 && (
+                    <div className="cost-estimate-note">Nothing typed: the prompt reaches the seats only through the attached file(s).</div>
+                  )}
+                </>
+              )}
             </div>
           )}
           <div className="input-form">
