@@ -248,6 +248,7 @@ Now provide your evaluation and ranking:"""
     voters = _voter_specs(effective_models, all_stage1)
     responses = await query_models_parallel(voters, messages, max_tokens=council_max_tokens if council_max_tokens is not None else STAGE2_MAX_TOKENS,
         reasoning_effort=STAGE2_REASONING_EFFORT)
+    label_by_seat = {r.get("seat"): lab for lab, r in zip(labels, stage1_results) if r.get("seat")}
 
     # Format results
     stage2_results = []
@@ -257,6 +258,10 @@ Now provide your evaluation and ranking:"""
             parsed = parse_ranking_from_text(full_text)
             stage2_results.append({
                 "model": f"{response['provider']}/{response['model']}",
+                "seat": seat_label,
+                # The anonymous label of this reviewer's own Stage 1 answer, so
+                # the aggregate can leave out a seat's vote for itself.
+                "self_label": f"Response {label_by_seat[seat_label]}" if seat_label in label_by_seat else None,
                 "ranking": full_text,
                 "parsed_ranking": parsed
             })
