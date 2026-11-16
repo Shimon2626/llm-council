@@ -67,3 +67,34 @@ export const seatTable = (s1) => [
     `${r.prompt_tokens ?? '?'} | ${r.completion_tokens ?? 0} | ${r.reasoning_tokens ?? 0} | ${r.duration_s ?? '?'} | ${r.attempts ?? '?'} |`),
   '',
 ];
+
+// ---- Report file name ------------------------------------------------------
+// LLM-Council-<name of the uploaded file, no extension>.md. With several files,
+// the first one that is not the council prompt/instructions is used (the prompt
+// file only says how to review; the subject is the other one). With no file,
+// the conversation topic is used. A name with no date-and-time in it gets the
+// current YYYYMMDD_HHMM appended so two runs never share a name.
+
+const HAS_STAMP = /\d{8}[_-]\d{4}/;
+const PROMPT_LIKE = /^(council[_ -]?prompt|prompt)(?![A-Za-z])/i;
+
+const pad = (n) => String(n).padStart(2, '0');
+export const stampNow = (d = new Date()) =>
+  `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}`;
+
+const stripExt = (name) => name.replace(/\.[A-Za-z0-9]{1,5}$/, '');
+
+// Letters, digits, underscore, hyphen, dot. Anything else becomes "_".
+const safe = (s) =>
+  (s || '').normalize('NFKD').replace(/[^\w.-]+/g, '_').replace(/_+/g, '_').replace(/^[_.-]+|[_.-]+$/g, '');
+
+export const attachmentNames = (query) => [...(query || '').matchAll(ATTACHED_BLOCK)].map((m) => m[1]);
+
+export const reportFileName = (query, topic, now = new Date()) => {
+  const names = attachmentNames(query);
+  const subject = names.find((n) => !PROMPT_LIKE.test(n)) ?? names[0];
+  let base = safe(subject ? stripExt(subject) : topic);
+  if (!base || base.toLowerCase() === 'new_conversation') base = 'report';
+  if (!HAS_STAMP.test(base)) base = `${base}_${stampNow(now)}`;
+  return `LLM-Council-${base}.md`;
+};
