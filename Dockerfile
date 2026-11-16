@@ -9,7 +9,8 @@ COPY frontend/ ./
 RUN npm run build
 
 FROM python:3.10-slim AS api
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+# uv comes from PyPI, not ghcr.io: the VPS gets 403 from ghcr.io's token endpoint.
+RUN python -m pip install --no-cache-dir uv==0.11.9
 WORKDIR /app
 COPY pyproject.toml uv.lock .python-version ./
 RUN uv sync --frozen --no-dev --no-install-project
