@@ -84,10 +84,13 @@ export default function Stage2({ rankings, labelToModel, aggregateRankings }) {
                   {agg.model.split('/')[1] || agg.model}
                 </span>
                 <span className="rank-score">
-                  Avg: {agg.average_rank.toFixed(2)}
+                  Avg: {agg.average_rank == null ? 'n/a' : agg.average_rank.toFixed(2)}
                 </span>
                 <span className="rank-count">
-                  ({agg.rankings_count} votes)
+                  ({agg.rankings_count} votes
+                  {agg.average_rank_all_votes != null && agg.self_votes > 0
+                    ? `, own vote excluded; all votes avg ${agg.average_rank_all_votes.toFixed(2)}`
+                    : ''})
                 </span>
               </div>
             ))}
