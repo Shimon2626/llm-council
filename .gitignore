@@ -18,5 +18,8 @@ data/
 # Frontend
 frontend/node_modules/
 frontend/dist/
-frontend/.vite/Icon?
+frontend/.vite/
+
+# macOS custom-folder-icon files (empty, name ends in carriage return)
+Icon?
 .DS_Store
