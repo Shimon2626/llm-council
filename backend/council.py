@@ -4,13 +4,14 @@ from typing import List, Dict, Any, Optional, Tuple
 from .openrouter import (
     query_models_parallel, query_model, is_empty, CHAIRMAN_MAX_TOKENS,
     STAGE1_REASONING_EFFORT, STAGE2_REASONING_EFFORT, CHAIRMAN_REASONING_EFFORT,
-    STAGE2_MAX_TOKENS,
+    STAGE2_MAX_TOKENS, DEFAULT_MAX_TOKENS,
 )
 from .config import (
     COUNCIL_MODELS, CHAIRMAN_MODEL, enrich_model_spec, enrich_council_models,
     dedupe_seats, reserve_seats, seat_base_model,
 )
 from . import pricing
+from .compliance import format_contract, check_response, parse_verdict, verdict_tally, guard_unanimity
 
 
 UNREADABLE_ATTACHMENT_RULE = (
@@ -64,6 +65,55 @@ def _seat_row(label: str, response: Optional[Dict[str, Any]], errors: List[Dict[
     if status in ("empty", "error"):
         row["error_detail"] = _failure_detail(response, errors)
     return row
+
+
+REASK_PART_TEXT = {
+    "verdict": "the verdict: ONE line that is exactly AGREE, PARTLY AGREE or DISAGREE (nothing before it)",
+    "table": "the table with one row for EACH of Q1 to Q12 (| Q# | KEEP/CHANGE/CUT | reason |)",
+}
+
+
+async def _enforce_format(rows, messages, specs_by_label, contract, max_tokens, cost_log):
+    """Check each complete seat against the prompt's format; re-ask once, for
+    the missing part only, when the verdict line or the Q-table is absent.
+    Every checked row gets row["compliance"]; over-long answers are only marked.
+    """
+    for row in rows:
+        if row.get("status") not in ("ok", "truncated"):
+            continue
+        result = check_response(row["response"], contract)
+        compliance = {"ok": result["ok"], "issues": result["issues"], "reasked": False}
+        spec = specs_by_label.get(row.get("seat"))
+        if result["missing"] and row["status"] == "ok" and spec is not None:
+            wanted = "; ".join(REASK_PART_TEXT[m] for m in result["missing"])
+            followup = messages + [
+                {"role": "assistant", "content": row["response"]},
+                {"role": "user", "content": f"Your reply is missing {wanted}. Send ONLY that missing part now, "
+                                            "with no other text and no repeat of the rest."},
+            ]
+            reply = await query_model(spec, followup, max_tokens=max_tokens or DEFAULT_MAX_TOKENS,
+                                      reasoning_effort=STAGE1_REASONING_EFFORT)
+            compliance["reasked"] = True
+            if reply is not None and not is_empty(reply):
+                extra = (reply.get("content") or "").strip()
+                if cost_log is not None:
+                    usage = reply.get("usage") or {}
+                    cost_log.append({"stage": 1, "provider": reply["provider"], "model": reply["model"],
+                                     "prompt_tokens": usage.get("prompt_tokens", 0),
+                                     "completion_tokens": usage.get("completion_tokens", 0)})
+                text = row["response"]
+                if "verdict" in result["missing"]:
+                    first = next((l.strip() for l in extra.splitlines() if parse_verdict(l)), None)
+                    if first:
+                        text = f"{first}\n\n{text}"
+                if "table" in result["missing"]:
+                    table = "\n".join(l for l in extra.splitlines() if l.strip().startswith("|"))
+                    if table:
+                        text = f"{text}\n\n[Table added after a re-ask]\n{table}"
+                row["response"] = text
+                again = check_response(text, contract)
+                compliance.update(ok=again["ok"], issues=again["issues"])
+        row["compliance"] = compliance
 
 
 async def stage1_collect_responses(
@@ -146,6 +196,11 @@ async def stage1_collect_responses(
             to_ask.append(reserve)
             replaces[_seat_label(reserve)] = f"{label} ({next(r['status'] for r in rows if r['seat'] == label)})"
             next(r for r in rows if r['seat'] == label)["replaced_by"] = _seat_label(reserve)
+
+    contract = format_contract(user_query)
+    if contract:
+        specs_by_label = {_seat_label(s): s for s in seats + reserve_seats()}
+        await _enforce_format(rows, messages, specs_by_label, contract, council_max_tokens, cost_log)
 
     return rows
 
