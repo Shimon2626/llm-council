@@ -331,6 +331,42 @@ Now provide your evaluation and ranking:"""
     return stage2_results, label_to_model
 
 
+def chairman_notes(user_query, stage1_results, stage2_results):
+    """Facts the chairman must not have to guess: seat failures, replacements,
+    format problems, self-votes and the verdict counts. Returns
+    (text, verdict_tally_or_None, complete_seat_count)."""
+    n_total = sum(1 for r in stage1_results if r.get("status") != "duplicate")
+    n_ok = sum(1 for r in stage1_results if r.get("status", "ok") == "ok")
+    n_cut = sum(1 for r in stage1_results if r.get("status") == "truncated")
+    n_none = sum(1 for r in stage1_results if r.get("status") in ("empty", "error"))
+    lines = [f"COUNCIL HEALTH: {n_total} seats asked; {n_ok} complete, {n_cut} cut off, {n_none} returned nothing. "
+             f"Peer ranking covered only the {n_ok + n_cut} that returned text."]
+    for r in stage1_results:
+        if r.get("status") in ("empty", "error"):
+            swap = f" Replaced by {r['replaced_by']}." if r.get("replaced_by") else ""
+            lines.append(f"SEAT FAILURE: {r['model']} returned nothing ({r.get('error_detail') or r.get('status')}).{swap}")
+        elif r.get("status") == "duplicate":
+            lines.append(f"SEAT REMOVED: {r['model']}: {r.get('error_detail')}.")
+    bad = [r for r in stage1_results if (r.get("compliance") or {}).get("ok") is False]
+    for r in bad:
+        lines.append(f"NON-COMPLIANT: {r['model']}: " + "; ".join(r["compliance"]["issues"]) +
+                     (" (re-asked once)" if r["compliance"].get("reasked") else ""))
+    firsts = []
+    for rk in stage2_results:
+        own = rk.get("self_label")
+        parsed = rk.get("parsed_ranking") or []
+        if own and parsed and parsed[0] == own:
+            firsts.append(rk["model"])
+    if firsts:
+        lines.append(f"SELF-VOTES: {len(firsts)} reviewer(s) ranked their own answer first ({', '.join(firsts)}). "
+                     "The aggregate average_rank leaves self-votes out; average_rank_all_votes includes them.")
+    tally = verdict_tally(stage1_results) if format_contract(user_query) else None
+    if tally is not None:
+        lines.append("VERDICT TALLY (counted by the program from each seat's first line): " +
+                     ", ".join(f"{k} {v}" for k, v in tally.items()))
+    return "\n".join(lines), tally, n_ok
+
+
 async def stage3_synthesize_final(
     user_query: str,
     stage1_results: List[Dict[str, Any]],
@@ -359,22 +395,18 @@ async def stage3_synthesize_final(
     # Build comprehensive context for chairman
     def _stage1_block(result):
         status = result.get("status", "ok")
-        if status in ("empty", "error"):
+        if status in ("empty", "error", "duplicate"):
             return f"Model: {result['model']}\nResponse: [NO RESPONSE: {status}. Contributes nothing.]"
         note = "\n[This response was CUT OFF at the output limit; later sections do not exist.]" if status == "truncated" else ""
         return f"Model: {result['model']}\nResponse: {result['response']}{note}"
 
     stage1_text = "\n\n".join(_stage1_block(r) for r in stage1_results)
-    n_total = len(stage1_results)
-    n_ok = sum(1 for r in stage1_results if r.get("status", "ok") == "ok")
-    n_cut = sum(1 for r in stage1_results if r.get("status") == "truncated")
-    n_none = n_total - n_ok - n_cut
-    health = (f"COUNCIL HEALTH: {n_total} seats asked; {n_ok} complete, {n_cut} cut off, {n_none} returned nothing. "
-              f"Peer ranking covered only the {n_ok + n_cut} that returned text. "
-              + ("Web search was ON for stage 1: seats received search results, but the council did not "
-                 "independently verify any cited URL or figure; attribute claims to the seat, not as confirmed."
-                 if web_search else
-                 "No seat had web access or could open links: no URL, figure or source in any response was checked."))
+    notes, tally, n_ok = chairman_notes(user_query, stage1_results, stage2_results)
+    health = notes + "\n" + (
+        "Web search was ON for stage 1: seats received search results, but the council did not "
+        "independently verify any cited URL or figure; attribute claims to the seat, not as confirmed."
+        if web_search else
+        "No seat had web access or could open links: no URL, figure or source in any response was checked.")
 
     stage2_text = "\n\n".join([
         f"Model: {result['model']}\nRanking: {result['ranking']}"
@@ -403,6 +435,8 @@ Rules for the synthesis:
 - Use ONLY what the responses support. If no complete response covers a part of the question, write "NOT COVERED" for that part. Do not fill it in from your own knowledge or invent it, and do not present a cut-off response as finished.
 - Where a response invented facts about material it was not given, or contradicted the question's own rules, say so and do not repeat it as a finding.
 - Say plainly that nothing was browsed or source-checked if the question asked for that.
+- Never write that "all", "every" or "all N" seats/reviewers agree, or that the council is unanimous, unless the VERDICT TALLY above shows every complete answer as AGREE. Give the counts from the tally instead. Where a seat said something was not established, do not report that point as agreed.
+- Mention the seat failures, non-compliant answers and self-votes listed above where they affect how far the result can be trusted.
 
 Provide a clear, well-reasoned final answer that represents the council's collective wisdom:"""
 
@@ -437,7 +471,7 @@ Provide a clear, well-reasoned final answer that represents the council's collec
 
     return {
         "model": f"{response['provider']}/{response['model']}",
-        "response": response.get('content') or '',
+        "response": guard_unanimity(response.get('content') or '', tally, n_ok),
         "status": "empty" if response.get('empty') else "truncated" if response.get('truncated') else "ok",
         "finish_reason": response.get('finish_reason'),
     }
