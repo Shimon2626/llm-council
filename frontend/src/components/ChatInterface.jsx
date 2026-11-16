@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { typedPrompt, attachmentPreviewBlocks, attachmentTable, healthLines, seatTable } from '../reportText';
+import { reportFileName, typedPrompt, attachmentPreviewBlocks, attachmentTable, healthLines, seatTable } from '../reportText';
 import ReactMarkdown from 'react-markdown';
 import Stage1 from './Stage1';
 import Stage2 from './Stage2';
@@ -409,7 +409,7 @@ export default function ChatInterface({
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `llm-council-report-${Date.now()}.md`;
+    a.download = reportFileName(userQuery, conversation?.title);
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);

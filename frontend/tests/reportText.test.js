@@ -53,3 +53,36 @@ test('attachmentPreviewBlocks returns only the labelled previews', () => {
   assert.ok(!out.includes('typed words'));
   assert.match(out, /full length 1,000 chars/);
 });
+
+import { reportFileName, stampNow } from '../src/reportText.js';
+
+const att = (...names) => names.map((n) => `**Attached file: ${n}**\n\`\`\`\nx\n\`\`\``).join('\n\n');
+const NOW = new Date(2026, 10, 16, 14, 5);
+
+test('file name is LLM-Council- plus the uploaded plan file name, as asked', () => {
+  const q = att('Table_Optimization_Plan_20261116_1351_v1_0.docx', 'Council_Prompt_Table_Optimization_20261116_1351_v1_0.docx');
+  assert.equal(reportFileName(q, 'whatever', NOW), 'LLM-Council-Table_Optimization_Plan_20261116_1351_v1_0.md');
+});
+
+test('the council prompt file is skipped even when it is attached first', () => {
+  const q = att('Council_Prompt_X_20261116_1351_v1_0.docx', 'Plan_20261116_1351_v1_0.docx');
+  assert.equal(reportFileName(q, '', NOW), 'LLM-Council-Plan_20261116_1351_v1_0.md');
+});
+
+test('only a prompt file attached: use it rather than nothing', () => {
+  assert.equal(reportFileName(att('Council_Prompt_A_20261116_1351_v1_0.docx'), '', NOW), 'LLM-Council-Council_Prompt_A_20261116_1351_v1_0.md');
+});
+
+test('an uploaded name without a date gets the current date and time appended', () => {
+  assert.equal(reportFileName(att('notes.txt'), '', NOW), `LLM-Council-notes_${stampNow(NOW)}.md`);
+  assert.equal(stampNow(NOW), '20261116_1405');
+});
+
+test('no attachment: topic is used, made file-safe, with date and time', () => {
+  assert.equal(reportFileName('just typed', 'Pricing: Q4 / EU plan?', NOW), 'LLM-Council-Pricing_Q4_EU_plan_20261116_1405.md');
+});
+
+test('no attachment and no usable topic falls back to "report"', () => {
+  assert.equal(reportFileName('x', 'New Conversation', NOW), 'LLM-Council-report_20261116_1405.md');
+  assert.equal(reportFileName('x', undefined, NOW), 'LLM-Council-report_20261116_1405.md');
+});
