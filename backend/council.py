@@ -4,10 +4,14 @@ from typing import List, Dict, Any, Optional, Tuple
 from .openrouter import (
     query_models_parallel, query_model, is_empty, CHAIRMAN_MAX_TOKENS,
     STAGE1_REASONING_EFFORT, STAGE2_REASONING_EFFORT, CHAIRMAN_REASONING_EFFORT,
-    STAGE2_MAX_TOKENS,
+    STAGE2_MAX_TOKENS, DEFAULT_MAX_TOKENS,
 )
-from .config import COUNCIL_MODELS, CHAIRMAN_MODEL, enrich_model_spec, enrich_council_models
+from .config import (
+    COUNCIL_MODELS, CHAIRMAN_MODEL, enrich_model_spec, enrich_council_models,
+    dedupe_seats, reserve_seats, seat_base_model,
+)
 from . import pricing
+from .compliance import format_contract, check_response, parse_verdict, verdict_tally, guard_unanimity
 
 
 UNREADABLE_ATTACHMENT_RULE = (
@@ -15,6 +19,102 @@ UNREADABLE_ATTACHMENT_RULE = (
     "to be binary data, say so plainly and mark what you cannot judge. Never "
     "infer, reconstruct or invent the contents of something you cannot read."
 )
+
+def _seat_label(spec) -> str:
+    """Same stable label query_models_parallel uses for a seat."""
+    return spec if isinstance(spec, str) else (spec.get("nvidia") or spec.get("openrouter"))
+
+
+def _failure_detail(response: Optional[Dict[str, Any]], errors: List[Dict[str, Any]]) -> str:
+    """One readable line saying why a seat produced no usable text."""
+    parts = []
+    for e in errors:
+        said = e.get("body") or e.get("error") or ""
+        status = f"HTTP {e['http_status']} " if e.get("http_status") else ""
+        parts.append(f"{e['provider']}/{e['model']} try {e['attempt']}: {status}{said}".strip())
+    if response is not None and response.get("empty"):
+        parts.append(f"empty reply (finish_reason={response.get('finish_reason')}, "
+                     f"completion_tokens={(response.get('usage') or {}).get('completion_tokens', 0)})")
+    return " | ".join(parts)[:1200]
+
+
+def _seat_row(label: str, response: Optional[Dict[str, Any]], errors: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if response is None:
+        return {
+            "model": label, "seat": label, "response": "", "status": "error",
+            "finish_reason": None, "completion_tokens": 0, "reasoning_tokens": 0, "prompt_tokens": 0,
+            "duration_s": None, "attempts": len(errors), "errors": errors,
+            "error_detail": _failure_detail(None, errors),
+        }
+    usage = response.get('usage') or {}
+    status = "empty" if response.get('empty') else "truncated" if response.get('truncated') else "ok"
+    row = {
+        "model": f"{response['provider']}/{response['model']}",
+        "seat": label,
+        "response": response.get('content') or '',
+        "status": status,
+        "finish_reason": response.get('finish_reason'),
+        "prompt_tokens": usage.get('prompt_tokens', 0),
+        "completion_tokens": usage.get('completion_tokens', 0),
+        "reasoning_tokens": usage.get('reasoning_tokens', 0),
+        "duration_s": response.get('duration_s'),
+        "attempts": response.get('attempts', 1),
+    }
+    if errors:
+        row["errors"] = errors  # earlier provider attempts that failed before this one answered
+    if status in ("empty", "error"):
+        row["error_detail"] = _failure_detail(response, errors)
+    return row
+
+
+REASK_PART_TEXT = {
+    "verdict": "the verdict: ONE line that is exactly AGREE, PARTLY AGREE or DISAGREE (nothing before it)",
+    "table": "the table with one row for EACH of Q1 to Q12 (| Q# | KEEP/CHANGE/CUT | reason |)",
+}
+
+
+async def _enforce_format(rows, messages, specs_by_label, contract, max_tokens, cost_log):
+    """Check each complete seat against the prompt's format; re-ask once, for
+    the missing part only, when the verdict line or the Q-table is absent.
+    Every checked row gets row["compliance"]; over-long answers are only marked.
+    """
+    for row in rows:
+        if row.get("status") not in ("ok", "truncated"):
+            continue
+        result = check_response(row["response"], contract)
+        compliance = {"ok": result["ok"], "issues": result["issues"], "reasked": False}
+        spec = specs_by_label.get(row.get("seat"))
+        if result["missing"] and row["status"] == "ok" and spec is not None:
+            wanted = "; ".join(REASK_PART_TEXT[m] for m in result["missing"])
+            followup = messages + [
+                {"role": "assistant", "content": row["response"]},
+                {"role": "user", "content": f"Your reply is missing {wanted}. Send ONLY that missing part now, "
+                                            "with no other text and no repeat of the rest."},
+            ]
+            reply = await query_model(spec, followup, max_tokens=max_tokens or DEFAULT_MAX_TOKENS,
+                                      reasoning_effort=STAGE1_REASONING_EFFORT)
+            compliance["reasked"] = True
+            if reply is not None and not is_empty(reply):
+                extra = (reply.get("content") or "").strip()
+                if cost_log is not None:
+                    usage = reply.get("usage") or {}
+                    cost_log.append({"stage": 1, "provider": reply["provider"], "model": reply["model"],
+                                     "prompt_tokens": usage.get("prompt_tokens", 0),
+                                     "completion_tokens": usage.get("completion_tokens", 0)})
+                text = row["response"]
+                if "verdict" in result["missing"]:
+                    first = next((l.strip() for l in extra.splitlines() if parse_verdict(l)), None)
+                    if first:
+                        text = f"{first}\n\n{text}"
+                if "table" in result["missing"]:
+                    table = "\n".join(l for l in extra.splitlines() if l.strip().startswith("|"))
+                    if table:
+                        text = f"{text}\n\n[Table added after a re-ask]\n{table}"
+                row["response"] = text
+                again = check_response(text, contract)
+                compliance.update(ok=again["ok"], issues=again["issues"])
+        row["compliance"] = compliance
+
 
 async def stage1_collect_responses(
     user_query: str,
@@ -25,6 +125,11 @@ async def stage1_collect_responses(
 ) -> List[Dict[str, Any]]:
     """
     Stage 1: Collect individual responses from all council models.
+
+    Seats are de-duplicated by base model first. A seat that returns nothing
+    (after the retry inside query_model) is replaced from the reserve list, so
+    the council keeps its full seat count; the failed seat keeps its row, with
+    the provider's error text, so the failure is visible and not just replaced.
 
     Args:
         user_query: The user's question
@@ -38,50 +143,81 @@ async def stage1_collect_responses(
             bother" — callers that don't need actual cost just omit it.
 
     Returns:
-        List of dicts with 'model' and 'response' keys
+        List of row dicts: 'model', 'response', 'status', plus run details.
     """
     messages = [
         {"role": "system", "content": UNREADABLE_ATTACHMENT_RULE},
         {"role": "user", "content": user_query},
     ]
 
-    # Query all models in parallel. Each explicitly-picked seat gets its
-    # verified cross-provider equivalent backfilled (enrich_model_spec) so a
-    # single-provider pick still fails over on error, same as the default
-    # council's dual-provider entries.
+    # Each explicitly-picked seat gets its verified cross-provider equivalent
+    # backfilled (enrich_model_spec) so a single-provider pick still fails over.
     effective_models = enrich_council_models(council_models) if council_models else COUNCIL_MODELS
-    responses = await query_models_parallel(effective_models, messages, max_tokens=council_max_tokens, reasoning_effort=STAGE1_REASONING_EFFORT, web_search=web_search)
+    seats, dropped = dedupe_seats(effective_models)
+    pool = [r for r in reserve_seats() if seat_base_model(r) not in {seat_base_model(s) for s in seats}]
 
-    # Format results. EVERY seat gets a row, including failures: a seat that
-    # returned nothing used to vanish (None) or pass as an empty "success",
-    # which hid it from the report and let it be ranked as if it had answered.
-    stage1_results = []
-    for seat_label, response in responses.items():
-        if response is None:
-            stage1_results.append({
-                "model": seat_label, "response": "", "status": "error",
-                "finish_reason": None, "completion_tokens": 0, "reasoning_tokens": 0,
-            })
-            continue
-        usage = response.get('usage') or {}
-        status = "empty" if response.get('empty') else "truncated" if response.get('truncated') else "ok"
-        stage1_results.append({
-            "model": f"{response['provider']}/{response['model']}",
-            "response": response.get('content') or '',
-            "status": status,
-            "finish_reason": response.get('finish_reason'),
-            "completion_tokens": usage.get('completion_tokens', 0),
-            "reasoning_tokens": usage.get('reasoning_tokens', 0),
-            "attempts": response.get('attempts', 1),
-        })
-        if cost_log is not None:
-            cost_log.append({
-                "stage": 1, "provider": response['provider'], "model": response['model'],
-                "prompt_tokens": usage.get('prompt_tokens', 0),
-                "completion_tokens": usage.get('completion_tokens', 0),
-            })
+    rows: List[Dict[str, Any]] = []
+    replaces: Dict[str, str] = {}  # reserve seat label -> why it was seated
+    for spec, base in dropped:
+        rows.append({"model": _seat_label(spec), "seat": _seat_label(spec), "response": "", "status": "duplicate",
+                     "finish_reason": None, "completion_tokens": 0, "reasoning_tokens": 0,
+                     "error_detail": f"same base model as another seat ({base}); not asked"})
+        if pool:
+            reserve = pool.pop(0)
+            seats.append(reserve)
+            replaces[_seat_label(reserve)] = f"{_seat_label(spec)} (duplicate of {base})"
 
-    return stage1_results
+    to_ask = list(seats)
+    while to_ask:
+        error_logs: Dict[str, List[Dict[str, Any]]] = {}
+        responses = await query_models_parallel(
+            to_ask, messages, max_tokens=council_max_tokens,
+            reasoning_effort=STAGE1_REASONING_EFFORT, web_search=web_search, error_logs=error_logs)
+        failed_labels = []
+        for label, response in responses.items():
+            row = _seat_row(label, response, error_logs.get(label, []))
+            if label in replaces:
+                row["replaces"] = replaces[label]
+            rows.append(row)
+            if row["status"] in ("error", "empty"):
+                failed_labels.append(label)
+            if response is not None and cost_log is not None:
+                usage = response.get('usage') or {}
+                cost_log.append({
+                    "stage": 1, "provider": response['provider'], "model": response['model'],
+                    "prompt_tokens": usage.get('prompt_tokens', 0),
+                    "completion_tokens": usage.get('completion_tokens', 0),
+                })
+        to_ask = []
+        for label in failed_labels:
+            if not pool:
+                break
+            reserve = pool.pop(0)
+            to_ask.append(reserve)
+            replaces[_seat_label(reserve)] = f"{label} ({next(r['status'] for r in rows if r['seat'] == label)})"
+            next(r for r in rows if r['seat'] == label)["replaced_by"] = _seat_label(reserve)
+
+    contract = format_contract(user_query)
+    if contract:
+        specs_by_label = {_seat_label(s): s for s in seats + reserve_seats()}
+        await _enforce_format(rows, messages, specs_by_label, contract, council_max_tokens, cost_log)
+
+    return rows
+
+
+def _voter_specs(effective_models, stage1_rows):
+    """Seats that vote in Stage 2: those that gave usable Stage 1 text.
+
+    A seat that failed or was removed as a duplicate used to be asked to rank
+    anyway (a paid call for a seat already known to be failing); a reserve that
+    replaced it was never asked. Rows without a "seat" (older callers) keep the
+    old behaviour: every configured seat votes.
+    """
+    if not any(r.get("seat") for r in stage1_rows):
+        return effective_models
+    known = {_seat_label(s): s for s in dedupe_seats(effective_models)[0] + reserve_seats()}
+    return [known[r["seat"]] for r in stage1_rows
+            if r.get("status", "ok") in ("ok", "truncated") and r.get("seat") in known]
 
 
 async def stage2_collect_rankings(
@@ -164,8 +300,10 @@ Now provide your evaluation and ranking:"""
 
     # Get rankings from all council models in parallel (same fallback backfill as stage 1)
     effective_models = enrich_council_models(council_models) if council_models else COUNCIL_MODELS
-    responses = await query_models_parallel(effective_models, messages, max_tokens=council_max_tokens if council_max_tokens is not None else STAGE2_MAX_TOKENS,
+    voters = _voter_specs(effective_models, all_stage1)
+    responses = await query_models_parallel(voters, messages, max_tokens=council_max_tokens if council_max_tokens is not None else STAGE2_MAX_TOKENS,
         reasoning_effort=STAGE2_REASONING_EFFORT)
+    label_by_seat = {r.get("seat"): lab for lab, r in zip(labels, stage1_results) if r.get("seat")}
 
     # Format results
     stage2_results = []
@@ -175,6 +313,10 @@ Now provide your evaluation and ranking:"""
             parsed = parse_ranking_from_text(full_text)
             stage2_results.append({
                 "model": f"{response['provider']}/{response['model']}",
+                "seat": seat_label,
+                # The anonymous label of this reviewer's own Stage 1 answer, so
+                # the aggregate can leave out a seat's vote for itself.
+                "self_label": f"Response {label_by_seat[seat_label]}" if seat_label in label_by_seat else None,
                 "ranking": full_text,
                 "parsed_ranking": parsed
             })
@@ -187,6 +329,42 @@ Now provide your evaluation and ranking:"""
                 })
 
     return stage2_results, label_to_model
+
+
+def chairman_notes(user_query, stage1_results, stage2_results):
+    """Facts the chairman must not have to guess: seat failures, replacements,
+    format problems, self-votes and the verdict counts. Returns
+    (text, verdict_tally_or_None, complete_seat_count)."""
+    n_total = sum(1 for r in stage1_results if r.get("status") != "duplicate")
+    n_ok = sum(1 for r in stage1_results if r.get("status", "ok") == "ok")
+    n_cut = sum(1 for r in stage1_results if r.get("status") == "truncated")
+    n_none = sum(1 for r in stage1_results if r.get("status") in ("empty", "error"))
+    lines = [f"COUNCIL HEALTH: {n_total} seats asked; {n_ok} complete, {n_cut} cut off, {n_none} returned nothing. "
+             f"Peer ranking covered only the {n_ok + n_cut} that returned text."]
+    for r in stage1_results:
+        if r.get("status") in ("empty", "error"):
+            swap = f" Replaced by {r['replaced_by']}." if r.get("replaced_by") else ""
+            lines.append(f"SEAT FAILURE: {r['model']} returned nothing ({r.get('error_detail') or r.get('status')}).{swap}")
+        elif r.get("status") == "duplicate":
+            lines.append(f"SEAT REMOVED: {r['model']}: {r.get('error_detail')}.")
+    bad = [r for r in stage1_results if (r.get("compliance") or {}).get("ok") is False]
+    for r in bad:
+        lines.append(f"NON-COMPLIANT: {r['model']}: " + "; ".join(r["compliance"]["issues"]) +
+                     (" (re-asked once)" if r["compliance"].get("reasked") else ""))
+    firsts = []
+    for rk in stage2_results:
+        own = rk.get("self_label")
+        parsed = rk.get("parsed_ranking") or []
+        if own and parsed and parsed[0] == own:
+            firsts.append(rk["model"])
+    if firsts:
+        lines.append(f"SELF-VOTES: {len(firsts)} reviewer(s) ranked their own answer first ({', '.join(firsts)}). "
+                     "The aggregate average_rank leaves self-votes out; average_rank_all_votes includes them.")
+    tally = verdict_tally(stage1_results) if format_contract(user_query) else None
+    if tally is not None:
+        lines.append("VERDICT TALLY (counted by the program from each seat's first line): " +
+                     ", ".join(f"{k} {v}" for k, v in tally.items()))
+    return "\n".join(lines), tally, n_ok
 
 
 async def stage3_synthesize_final(
@@ -217,22 +395,18 @@ async def stage3_synthesize_final(
     # Build comprehensive context for chairman
     def _stage1_block(result):
         status = result.get("status", "ok")
-        if status in ("empty", "error"):
+        if status in ("empty", "error", "duplicate"):
             return f"Model: {result['model']}\nResponse: [NO RESPONSE: {status}. Contributes nothing.]"
         note = "\n[This response was CUT OFF at the output limit; later sections do not exist.]" if status == "truncated" else ""
         return f"Model: {result['model']}\nResponse: {result['response']}{note}"
 
     stage1_text = "\n\n".join(_stage1_block(r) for r in stage1_results)
-    n_total = len(stage1_results)
-    n_ok = sum(1 for r in stage1_results if r.get("status", "ok") == "ok")
-    n_cut = sum(1 for r in stage1_results if r.get("status") == "truncated")
-    n_none = n_total - n_ok - n_cut
-    health = (f"COUNCIL HEALTH: {n_total} seats asked; {n_ok} complete, {n_cut} cut off, {n_none} returned nothing. "
-              f"Peer ranking covered only the {n_ok + n_cut} that returned text. "
-              + ("Web search was ON for stage 1: seats received search results, but the council did not "
-                 "independently verify any cited URL or figure; attribute claims to the seat, not as confirmed."
-                 if web_search else
-                 "No seat had web access or could open links: no URL, figure or source in any response was checked."))
+    notes, tally, n_ok = chairman_notes(user_query, stage1_results, stage2_results)
+    health = notes + "\n" + (
+        "Web search was ON for stage 1: seats received search results, but the council did not "
+        "independently verify any cited URL or figure; attribute claims to the seat, not as confirmed."
+        if web_search else
+        "No seat had web access or could open links: no URL, figure or source in any response was checked.")
 
     stage2_text = "\n\n".join([
         f"Model: {result['model']}\nRanking: {result['ranking']}"
@@ -261,6 +435,8 @@ Rules for the synthesis:
 - Use ONLY what the responses support. If no complete response covers a part of the question, write "NOT COVERED" for that part. Do not fill it in from your own knowledge or invent it, and do not present a cut-off response as finished.
 - Where a response invented facts about material it was not given, or contradicted the question's own rules, say so and do not repeat it as a finding.
 - Say plainly that nothing was browsed or source-checked if the question asked for that.
+- Never write that "all", "every" or "all N" seats/reviewers agree, or that the council is unanimous, unless the VERDICT TALLY above shows every complete answer as AGREE. Give the counts from the tally instead. Where a seat said something was not established, do not report that point as agreed.
+- Mention the seat failures, non-compliant answers and self-votes listed above where they affect how far the result can be trusted.
 
 Provide a clear, well-reasoned final answer that represents the council's collective wisdom:"""
 
@@ -295,7 +471,7 @@ Provide a clear, well-reasoned final answer that represents the council's collec
 
     return {
         "model": f"{response['provider']}/{response['model']}",
-        "response": response.get('content') or '',
+        "response": guard_unanimity(response.get('content') or '', tally, n_ok),
         "status": "empty" if response.get('empty') else "truncated" if response.get('truncated') else "ok",
         "finish_reason": response.get('finish_reason'),
     }
@@ -342,43 +518,52 @@ def calculate_aggregate_rankings(
     """
     Calculate aggregate rankings across all models.
 
+    A reviewer's ranking of its own answer is left out of `average_rank`
+    (self-votes pull the leaders' averages up). `average_rank_all_votes` keeps
+    them so both numbers can be shown side by side.
+
     Args:
-        stage2_results: Rankings from each model
+        stage2_results: Rankings from each model. A row's "self_label" names
+            the reviewer's own answer; without it the reviewer's model name is
+            compared with the label map.
         label_to_model: Mapping from anonymous labels to model names
 
     Returns:
-        List of dicts with model name and average rank, sorted best to worst
+        List of dicts with model name and average ranks, best (lowest) first.
+        average_rank is None for a model nobody else ranked.
     """
     from collections import defaultdict
 
-    # Track positions for each model
-    model_positions = defaultdict(list)
+    others = defaultdict(list)   # positions given by other seats
+    every = defaultdict(list)    # positions including the seat's own vote
 
     for ranking in stage2_results:
-        ranking_text = ranking['ranking']
-
-        # Parse the ranking from the structured format
-        parsed_ranking = parse_ranking_from_text(ranking_text)
-
+        parsed_ranking = parse_ranking_from_text(ranking['ranking'])
+        self_label = ranking.get("self_label")
         for position, label in enumerate(parsed_ranking, start=1):
-            if label in label_to_model:
-                model_name = label_to_model[label]
-                model_positions[model_name].append(position)
+            if label not in label_to_model:
+                continue
+            model_name = label_to_model[label]
+            is_self = (label == self_label) if self_label else (model_name == ranking.get("model"))
+            every[model_name].append(position)
+            if not is_self:
+                others[model_name].append(position)
 
-    # Calculate average position for each model
-    aggregate = []
-    for model, positions in model_positions.items():
-        if positions:
-            avg_rank = sum(positions) / len(positions)
-            aggregate.append({
-                "model": model,
-                "average_rank": round(avg_rank, 2),
-                "rankings_count": len(positions)
-            })
+    def avg(values):
+        return round(sum(values) / len(values), 2) if values else None
 
-    # Sort by average rank (lower is better)
-    aggregate.sort(key=lambda x: x['average_rank'])
-
+    aggregate = [
+        {
+            "model": model,
+            "average_rank": avg(others[model]),
+            "average_rank_all_votes": avg(positions),
+            "rankings_count": len(others[model]),
+            "all_votes_count": len(positions),
+            "self_votes": len(positions) - len(others[model]),
+        }
+        for model, positions in every.items()
+    ]
+    aggregate.sort(key=lambda x: (x['average_rank'] is None, x['average_rank'] if x['average_rank'] is not None else 0))
     return aggregate
 
 

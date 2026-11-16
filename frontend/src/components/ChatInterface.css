@@ -439,3 +439,20 @@
   background: #ccc;
   border-color: #ccc;
 }
+
+.preflight-panel {
+  margin: 0 0 8px;
+  font-size: 12px;
+  overflow-x: auto;
+}
+.preflight-table {
+  border-collapse: collapse;
+  width: 100%;
+}
+.preflight-table th,
+.preflight-table td {
+  border: 1px solid #ddd;
+  padding: 2px 6px;
+  text-align: left;
+  white-space: nowrap;
+}

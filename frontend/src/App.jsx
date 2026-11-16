@@ -104,6 +104,7 @@ function App() {
               const messages = [...prev.messages];
               const lastMsg = messages[messages.length - 1];
               lastMsg.loading.stage1 = true;
+              lastMsg.web_search = event.web_search;
               return { ...prev, messages };
             });
             break;

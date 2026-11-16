@@ -92,6 +92,23 @@ export const api = {
   },
 
   /**
+   * Attachment table and MANIFEST check for the message as it would be sent.
+   * `files`: what only the browser knows per file (bytes, sha256, and files it
+   * refused with status "skipped" and a reason).
+   */
+  async preflight(content, files) {
+    const response = await fetch(`${API_BASE}/api/preflight`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content, files }),
+    });
+    if (!response.ok) {
+      throw await errorFromResponse(response, 'Preflight failed');
+    }
+    return response.json();
+  },
+
+  /**
    * Whether each provider's API key is currently configured (booleans
    * only — the Setup modal never receives the actual key value back).
    */

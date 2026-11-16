@@ -4,7 +4,9 @@ Both providers expose an OpenAI-compatible chat/completions endpoint, so a
 single request/response shape covers both — only base_url and api_key differ.
 """
 
+import asyncio
 import os
+import time
 import httpx
 from typing import List, Dict, Any, Optional, Union
 from .config import PROVIDERS
@@ -120,6 +122,35 @@ def is_empty(response: Optional[Dict[str, Any]]) -> bool:
     return response is None or not (response.get('content') or '').strip()
 
 
+RETRY_DELAY_S = float(os.getenv("COUNCIL_RETRY_DELAY_S", "1"))
+ERROR_BODY_CHARS = 500
+
+
+def describe_error(e: Exception) -> Dict[str, Any]:
+    """What a failed provider call said, including the provider's own error body.
+
+    httpx's raise_for_status() text omits the body, which is where providers say
+    why (rate limit, retired model, bad key). Empty-string exceptions (timeouts)
+    fall back to the class name.
+    """
+    resp = getattr(e, "response", None)
+    status = getattr(resp, "status_code", None)
+    body = ""
+    if resp is not None:
+        try:
+            body = (resp.text or "")[:ERROR_BODY_CHARS]
+        except Exception:
+            body = ""
+    return {"error": str(e) or type(e).__name__, "http_status": status, "body": body}
+
+
+def _retryable(detail: Dict[str, Any]) -> bool:
+    """Retry network errors, timeouts, 429 and 5xx. Other 4xx (bad key, retired
+    model, malformed request) will fail the same way again."""
+    status = detail.get("http_status")
+    return status is None or status == 429 or status >= 500
+
+
 FREE_FALLBACK_PAID = os.getenv("COUNCIL_FREE_FALLBACK_PAID", "1") == "1"
 
 
@@ -146,7 +177,8 @@ async def query_model(
     timeout: Optional[float] = None,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     reasoning_effort: str = "",
-    web_search: bool = False
+    web_search: bool = False,
+    error_log: Optional[List[Dict[str, Any]]] = None
 ) -> Optional[Dict[str, Any]]:
     """
     Query one council seat, trying providers in order until one succeeds.
@@ -162,6 +194,8 @@ async def query_model(
         timeout: Request timeout override. If None, uses PROVIDER_TIMEOUTS
             per provider (short for NVIDIA, longer for OpenRouter).
         max_tokens: Completion token cap, forwarded to the provider.
+        error_log: optional list that receives one dict per failed provider
+            attempt: provider, model, attempt, error, http_status, body.
 
     Returns:
         Response dict with 'content', 'reasoning_details', 'provider', and
@@ -183,14 +217,19 @@ async def query_model(
         effective_timeout = timeout if timeout is not None else PROVIDER_TIMEOUTS[provider]
         cap = max_tokens
         for attempt in (1, 2):
+            started = time.monotonic()
             try:
                 result = await _call_provider(provider, model, messages, effective_timeout, cap, reasoning_effort, web_search)
             except Exception as e:
-                # httpx timeout/connection errors often stringify to "" — fall
-                # back to the exception class name so the log line is never blank.
-                reason = str(e) or type(e).__name__
-                print(f"Error querying {provider}/{model}: {reason}")
-                break  # hard error: next provider
+                detail = describe_error(e)
+                print(f"Error querying {provider}/{model} (attempt {attempt}): {detail['error']} {detail['body']}".rstrip())
+                if error_log is not None:
+                    error_log.append({"provider": provider, "model": model, "attempt": attempt, **detail})
+                if attempt == 1 and _retryable(detail):
+                    await asyncio.sleep(RETRY_DELAY_S)
+                    continue  # one retry of the same provider before failing over
+                break  # hard error, or retry already used: next provider
+            result['duration_s'] = round(time.monotonic() - started, 2)
             for k in spent:
                 spent[k] += (result.get('usage') or {}).get(k, 0)
             result['usage'] = dict(spent)  # a retry is billed too: report all of it
@@ -224,7 +263,8 @@ async def query_models_parallel(
     messages: List[Dict[str, str]],
     max_tokens: Optional[int] = None,
     reasoning_effort: str = "",
-    web_search: bool = False
+    web_search: bool = False,
+    error_logs: Optional[Dict[str, List[Dict[str, Any]]]] = None
 ) -> Dict[str, Optional[Dict[str, Any]]]:
     """
     Query multiple council seats in parallel, each with its own fallback chain.
@@ -239,9 +279,9 @@ async def query_models_parallel(
         Dict mapping a stable seat label (the NVIDIA model name, or the raw
         string for single-provider specs) to its response dict (or None if
         every provider for that seat failed).
+        error_logs: optional dict filled with each seat's failed-attempt
+            records (see query_model), keyed by the same label.
     """
-    import asyncio
-
     def seat_label(spec: ModelSpec) -> str:
         if isinstance(spec, str):
             return spec
@@ -249,7 +289,14 @@ async def query_models_parallel(
 
     labels = [seat_label(spec) for spec in model_specs]
     effective_max_tokens = max_tokens if max_tokens is not None else DEFAULT_MAX_TOKENS
-    tasks = [query_model(spec, messages, max_tokens=effective_max_tokens, reasoning_effort=reasoning_effort, web_search=web_search) for spec in model_specs]
+    if error_logs is not None:
+        for label in labels:
+            error_logs.setdefault(label, [])
+    tasks = [
+        query_model(spec, messages, max_tokens=effective_max_tokens, reasoning_effort=reasoning_effort,
+                    web_search=web_search, error_log=None if error_logs is None else error_logs[label])
+        for spec, label in zip(model_specs, labels)
+    ]
 
     responses = await asyncio.gather(*tasks)
 
