@@ -168,6 +168,8 @@ def add_assistant_message(
             "label_to_model": metadata.get("label_to_model"),
             "aggregate_rankings": metadata.get("aggregate_rankings"),
         }
+        if metadata.get("run_record") is not None:
+            message["metadata"]["run_record"] = metadata["run_record"]
 
     conversation["messages"].append(message)
 
