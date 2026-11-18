@@ -1,3 +1,4 @@
+import { usePersistedState } from '../persistedState';
 import ProgressBar from './ProgressBar';
 import { useState, useEffect, useRef } from 'react';
 import { reportFileName, typedPrompt, attachmentPreviewBlocks, attachmentTable, healthLines, seatTable } from '../reportText';
@@ -29,14 +30,14 @@ export default function ChatInterface({
   const [preflight, setPreflight] = useState(null);
   const [availableModels, setAvailableModels] = useState({ nvidia: [], openrouter: [] });
   const [showModelPicker, setShowModelPicker] = useState(false);
-  const [selectedSeats, setSelectedSeats] = useState([]); // [] means "use backend default council"
-  const [selectedChairman, setSelectedChairman] = useState(null); // null means "use backend default chairman"
+  const [selectedSeats, setSelectedSeats] = usePersistedState('council.seats', []); // [] means "use backend default council"
+  const [selectedChairman, setSelectedChairman] = usePersistedState('council.chairman', null); // null means "use backend default chairman"
   // Strings, not numbers: lets the field be genuinely empty (falls back to the
   // backend's own default) instead of coercing to 0. No provider accepts a
   // literal "unlimited" — this is a per-request override of the finite cap.
-  const [councilMaxTokens, setCouncilMaxTokens] = useState('');
-  const [chairmanMaxTokens, setChairmanMaxTokens] = useState('');
-  const [webMode, setWebMode] = useState('auto'); // auto | on | off
+  const [councilMaxTokens, setCouncilMaxTokens] = usePersistedState('council.councilMaxTokens', '');
+  const [chairmanMaxTokens, setChairmanMaxTokens] = usePersistedState('council.chairmanMaxTokens', '');
+  const [webMode, setWebMode] = usePersistedState('council.webMode', 'auto'); // auto | on | off
   // Full live OpenRouter catalog (id strings only), fetched once — used only
   // to validate a free-typed custom slug, not rendered as a checkbox list.
   const [openRouterCatalog, setOpenRouterCatalog] = useState(null);
