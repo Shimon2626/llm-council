@@ -81,7 +81,7 @@ class StageTests(unittest.TestCase):
     def test_stage2_excludes_empty_and_marks_truncated(self):
         seen = {}
 
-        async def fake_parallel(specs, messages, max_tokens=None, reasoning_effort="", web_search=False):
+        async def fake_parallel(specs, messages, max_tokens=None, reasoning_effort="", web_search=False, **_):
             seen["prompt"] = messages[-1]["content"]
             return {"s1": {"content": "A is best.\n\nFINAL RANKING:\n1. Response A\n2. Response B",
                            "provider": "openrouter", "model": "s1", "usage": {}}}

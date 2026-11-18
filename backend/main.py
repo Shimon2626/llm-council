@@ -59,7 +59,12 @@ class ClientStopped(Exception):
     model calls for a run nobody is waiting on anymore."""
 
 
-async def _run_with_heartbeat(coro, request: Request, heartbeat_interval: float = 15.0, poll_interval: float = 2.0):
+class StageProgress(dict):
+    """Seats finished / asked so far in a stage, yielded by _run_with_heartbeat."""
+
+
+async def _run_with_heartbeat(coro, request: Request, heartbeat_interval: float = 15.0, poll_interval: float = 2.0,
+                              progress: Optional[dict] = None):
     """Await `coro`, yielding None periodically while it's still pending so
     the SSE stream keeps sending bytes (see the module docstring note on
     why: a silent stage that takes minutes was getting dropped mid-run),
@@ -73,11 +78,15 @@ async def _run_with_heartbeat(coro, request: Request, heartbeat_interval: float 
     """
     task = asyncio.ensure_future(coro)
     elapsed_since_heartbeat = 0.0
+    last_progress = None
     try:
         while not task.done():
             if await request.is_disconnected():
                 raise ClientStopped()
             done, _ = await asyncio.wait({task}, timeout=poll_interval)
+            if progress is not None and progress != last_progress:
+                last_progress = dict(progress)
+                yield StageProgress(last_progress)
             if done:
                 break
             elapsed_since_heartbeat += poll_interval
@@ -597,9 +606,12 @@ async def send_message_stream(conversation_id: str, body: SendMessageRequest, ht
             # Stage 1: Collect responses
             yield f"data: {json.dumps({'type': 'stage1_start', 'web_search': web})}\n\n"
             stage1_results = None
-            async for item in _run_with_heartbeat(stage1_collect_responses(body.content, body.council_models, body.council_max_tokens, cost_log, web["enabled"]), http_request):
+            progress1 = {"done": 0, "total": 0}
+            async for item in _run_with_heartbeat(stage1_collect_responses(body.content, body.council_models, body.council_max_tokens, cost_log, web["enabled"], progress1), http_request, progress=progress1):
                 if item is None:
                     yield ": heartbeat\n\n"
+                elif isinstance(item, StageProgress):
+                    yield f"data: {json.dumps({'type': 'progress', 'stage': 1, **item})}\n\n"
                 else:
                     stage1_results = item
             yield f"data: {json.dumps({'type': 'stage1_complete', 'data': stage1_results})}\n\n"
@@ -607,9 +619,12 @@ async def send_message_stream(conversation_id: str, body: SendMessageRequest, ht
             # Stage 2: Collect rankings
             yield f"data: {json.dumps({'type': 'stage2_start'})}\n\n"
             stage2_result_pair = None
-            async for item in _run_with_heartbeat(stage2_collect_rankings(body.content, stage1_results, body.council_models, body.council_max_tokens, cost_log), http_request):
+            progress2 = {"done": 0, "total": 0}
+            async for item in _run_with_heartbeat(stage2_collect_rankings(body.content, stage1_results, body.council_models, body.council_max_tokens, cost_log, progress2), http_request, progress=progress2):
                 if item is None:
                     yield ": heartbeat\n\n"
+                elif isinstance(item, StageProgress):
+                    yield f"data: {json.dumps({'type': 'progress', 'stage': 2, **item})}\n\n"
                 else:
                     stage2_result_pair = item
             stage2_results, label_to_model = stage2_result_pair

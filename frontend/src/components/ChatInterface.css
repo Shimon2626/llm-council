@@ -456,3 +456,8 @@
   text-align: left;
   white-space: nowrap;
 }
+
+.progress { display: flex; align-items: center; gap: 10px; margin-left: 12px; }
+.progress-track { width: 160px; height: 8px; background: #e4e4e4; border-radius: 4px; overflow: hidden; }
+.progress-fill { height: 100%; background: #4a90e2; transition: width 0.4s ease; }
+.progress-label, .progress-note { font-size: 12px; color: #666; margin-left: 8px; }

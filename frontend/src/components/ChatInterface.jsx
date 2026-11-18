@@ -1,3 +1,4 @@
+import ProgressBar from './ProgressBar';
 import { useState, useEffect, useRef } from 'react';
 import { reportFileName, typedPrompt, attachmentPreviewBlocks, attachmentTable, healthLines, seatTable } from '../reportText';
 import ReactMarkdown from 'react-markdown';
@@ -628,6 +629,7 @@ export default function ChatInterface({
                     <div className="stage-loading">
                       <div className="spinner"></div>
                       <span>Running Stage 1: Collecting individual responses...</span>
+                      <ProgressBar done={msg.progress?.[1]?.done} total={msg.progress?.[1]?.total} unit="seats answered" />
                     </div>
                   )}
                   {msg.stage1 && <Stage1 responses={msg.stage1} />}
@@ -637,6 +639,7 @@ export default function ChatInterface({
                     <div className="stage-loading">
                       <div className="spinner"></div>
                       <span>Running Stage 2: Peer rankings...</span>
+                      <ProgressBar done={msg.progress?.[2]?.done} total={msg.progress?.[2]?.total} unit="seats ranked" />
                     </div>
                   )}
                   {msg.stage2 && (
@@ -652,6 +655,7 @@ export default function ChatInterface({
                     <div className="stage-loading">
                       <div className="spinner"></div>
                       <span>Running Stage 3: Final synthesis...</span>
+                      <ProgressBar done={0} total={1} unit="chairman writing" />
                     </div>
                   )}
                   {msg.stage3 && <Stage3 finalResponse={msg.stage3} />}

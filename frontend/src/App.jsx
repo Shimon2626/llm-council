@@ -109,6 +109,15 @@ function App() {
             });
             break;
 
+          case 'progress':
+            setCurrentConversation((prev) => {
+              const messages = [...prev.messages];
+              const lastMsg = messages[messages.length - 1];
+              lastMsg.progress = { ...lastMsg.progress, [event.stage]: { done: event.done, total: event.total } };
+              return { ...prev, messages };
+            });
+            break;
+
           case 'stage1_complete':
             setCurrentConversation((prev) => {
               const messages = [...prev.messages];
