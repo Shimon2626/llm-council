@@ -121,7 +121,8 @@ async def stage1_collect_responses(
     council_models: Optional[List[Dict[str, str]]] = None,
     council_max_tokens: Optional[int] = None,
     cost_log: Optional[List[Dict[str, Any]]] = None,
-    web_search: bool = False
+    web_search: bool = False,
+    progress: Optional[Dict[str, int]] = None
 ) -> List[Dict[str, Any]]:
     """
     Stage 1: Collect individual responses from all council models.
@@ -172,7 +173,8 @@ async def stage1_collect_responses(
         error_logs: Dict[str, List[Dict[str, Any]]] = {}
         responses = await query_models_parallel(
             to_ask, messages, max_tokens=council_max_tokens,
-            reasoning_effort=STAGE1_REASONING_EFFORT, web_search=web_search, error_logs=error_logs)
+            reasoning_effort=STAGE1_REASONING_EFFORT, web_search=web_search, error_logs=error_logs,
+            progress=progress)
         failed_labels = []
         for label, response in responses.items():
             row = _seat_row(label, response, error_logs.get(label, []))
@@ -225,7 +227,8 @@ async def stage2_collect_rankings(
     stage1_results: List[Dict[str, Any]],
     council_models: Optional[List[Dict[str, str]]] = None,
     council_max_tokens: Optional[int] = None,
-    cost_log: Optional[List[Dict[str, Any]]] = None
+    cost_log: Optional[List[Dict[str, Any]]] = None,
+    progress: Optional[Dict[str, int]] = None
 ) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
     """
     Stage 2: Each model ranks the anonymized responses.
@@ -302,7 +305,7 @@ Now provide your evaluation and ranking:"""
     effective_models = enrich_council_models(council_models) if council_models else COUNCIL_MODELS
     voters = _voter_specs(effective_models, all_stage1)
     responses = await query_models_parallel(voters, messages, max_tokens=council_max_tokens if council_max_tokens is not None else STAGE2_MAX_TOKENS,
-        reasoning_effort=STAGE2_REASONING_EFFORT)
+        reasoning_effort=STAGE2_REASONING_EFFORT, progress=progress)
     label_by_seat = {r.get("seat"): lab for lab, r in zip(labels, stage1_results) if r.get("seat")}
 
     # Format results

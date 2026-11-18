@@ -264,7 +264,8 @@ async def query_models_parallel(
     max_tokens: Optional[int] = None,
     reasoning_effort: str = "",
     web_search: bool = False,
-    error_logs: Optional[Dict[str, List[Dict[str, Any]]]] = None
+    error_logs: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    progress: Optional[Dict[str, int]] = None
 ) -> Dict[str, Optional[Dict[str, Any]]]:
     """
     Query multiple council seats in parallel, each with its own fallback chain.
@@ -292,11 +293,18 @@ async def query_models_parallel(
     if error_logs is not None:
         for label in labels:
             error_logs.setdefault(label, [])
-    tasks = [
-        query_model(spec, messages, max_tokens=effective_max_tokens, reasoning_effort=reasoning_effort,
-                    web_search=web_search, error_log=None if error_logs is None else error_logs[label])
-        for spec, label in zip(model_specs, labels)
-    ]
+    async def run_seat(spec, label):
+        try:
+            return await query_model(
+                spec, messages, max_tokens=effective_max_tokens, reasoning_effort=reasoning_effort,
+                web_search=web_search, error_log=None if error_logs is None else error_logs[label])
+        finally:
+            if progress is not None:
+                progress["done"] = progress.get("done", 0) + 1
+
+    if progress is not None:
+        progress["total"] = progress.get("total", 0) + len(model_specs)
+    tasks = [run_seat(spec, label) for spec, label in zip(model_specs, labels)]
 
     responses = await asyncio.gather(*tasks)
 
