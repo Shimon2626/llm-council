@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import Sidebar from './components/Sidebar';
 import ChatInterface from './components/ChatInterface';
 import { api } from './api';
+import { playDoneSound } from './doneSound';
 import './App.css';
 
 function App() {
@@ -176,6 +177,7 @@ function App() {
             // Stream complete, reload conversations list
             loadConversations();
             setIsLoading(false);
+            playDoneSound();
             break;
 
           case 'error':
