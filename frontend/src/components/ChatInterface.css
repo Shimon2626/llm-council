@@ -461,3 +461,15 @@
 .progress-track { width: 160px; height: 8px; background: #e4e4e4; border-radius: 4px; overflow: hidden; }
 .progress-fill { height: 100%; background: #4a90e2; transition: width 0.4s ease; }
 .progress-label, .progress-note { font-size: 12px; color: #666; margin-left: 8px; }
+
+.run-settings { margin-top: 12px; }
+.run-settings-toggle { background: none; border: none; cursor: pointer; font-weight: 600; padding: 4px 0; color: inherit; }
+.run-settings-body { display: grid; gap: 10px; margin-top: 8px; }
+.run-settings-field { display: grid; gap: 2px; }
+.run-settings-label { font-weight: 600; font-size: 13px; }
+.run-settings-help { font-size: 12px; opacity: 0.7; }
+.run-settings-reset { justify-self: start; cursor: pointer; }
+.run-estimate { font-size: 12px; opacity: 0.85; margin: 6px 0; display: grid; gap: 2px; }
+
+.attachment-chip-prompt { margin-left: 6px; padding: 0 6px; font-size: 11px; border: 1px solid currentColor; border-radius: 8px; background: transparent; color: inherit; cursor: pointer; opacity: 0.7; }
+.attachment-chip-prompt-on { opacity: 1; font-weight: 600; background: rgba(80, 140, 255, 0.2); }

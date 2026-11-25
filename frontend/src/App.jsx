@@ -62,7 +62,7 @@ function App() {
     setCurrentConversationId(id);
   };
 
-  const handleSendMessage = async (content, councilModels, chairmanModel, councilMaxTokens, chairmanMaxTokens, webSearch) => {
+  const handleSendMessage = async (content, councilModels, chairmanModel, councilMaxTokens, chairmanMaxTokens, webSearch, runSettings) => {
     if (!currentConversationId) return;
 
     const controller = new AbortController();
@@ -197,7 +197,7 @@ function App() {
           default:
             console.log('Unknown event type:', eventType);
         }
-      }, councilModels, chairmanModel, councilMaxTokens, chairmanMaxTokens, controller.signal, webSearch);
+      }, councilModels, chairmanModel, councilMaxTokens, chairmanMaxTokens, controller.signal, webSearch, runSettings);
     } catch (error) {
       const wasStopped = error.name === 'AbortError';
       if (!wasStopped) {

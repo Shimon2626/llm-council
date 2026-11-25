@@ -1,12 +1,24 @@
 import { usePersistedState } from '../persistedState';
 import ProgressBar from './ProgressBar';
 import { useState, useEffect, useRef } from 'react';
-import { reportFileName, typedPrompt, attachmentPreviewBlocks, attachmentTable, healthLines, seatTable } from '../reportText';
+import { reportFileName, typedPrompt, attachmentPreviewBlocks, attachmentTable, settingsTable, healthLines, seatTable } from '../reportText';
 import ReactMarkdown from 'react-markdown';
 import Stage1 from './Stage1';
 import Stage2 from './Stage2';
 import Stage3 from './Stage3';
 import { api } from '../api';
+import {
+  SETTING_FIELDS,
+  REASONING_OPTIONS,
+  REASONING_KEYS,
+  DEFAULT_RUN_SETTINGS,
+  loadRunSettings,
+  saveRunSettings,
+  buildRunPayload,
+  estimateInputTokens,
+  seatsCapTokens,
+  attachmentCutOff,
+} from '../runSettings';
 import './ChatInterface.css';
 
 // A "seat" is a single-provider pick, e.g. { provider: 'nvidia', model: 'meta/llama-3.1-70b-instruct' }.
@@ -38,6 +50,12 @@ export default function ChatInterface({
   const [councilMaxTokens, setCouncilMaxTokens] = usePersistedState('council.councilMaxTokens', '');
   const [chairmanMaxTokens, setChairmanMaxTokens] = usePersistedState('council.chairmanMaxTokens', '');
   const [webMode, setWebMode] = usePersistedState('council.webMode', 'auto'); // auto | on | off
+  // Per-run token/reasoning limits: last-used values persist in localStorage.
+  const [runSettings, setRunSettings] = useState(() => loadRunSettings(window.localStorage));
+  const [showRunSettings, setShowRunSettings] = useState(false);
+  useEffect(() => {
+    saveRunSettings(window.localStorage, runSettings);
+  }, [runSettings]);
   // Full live OpenRouter catalog (id strings only), fetched once — used only
   // to validate a free-typed custom slug, not rendered as a checkbox list.
   const [openRouterCatalog, setOpenRouterCatalog] = useState(null);
@@ -198,7 +216,7 @@ export default function ChatInterface({
         return;
       }
       if (lowerName.endsWith('.xlsx') || lowerName.endsWith('.pptx')) {
-        uploadExtracted(file, api.extractOffice, textHeader(file));
+        uploadExtracted(file, (f) => api.extractOffice(f, runSettings.max_office_extract_chars), textHeader(file));
         return;
       }
       const reader = new FileReader();
@@ -230,7 +248,7 @@ export default function ChatInterface({
       const content = `${buildHeader(result)}\n\n${result.extracted_text}`;
       setAttachments((prev) =>
         prev.some((a) => a.name === file.name)
-          ? prev.map((a) => (a.name === file.name ? { name: file.name, content, kind: 'extracted' } : a))
+          ? prev.map((a) => (a.name === file.name ? { ...a, content, kind: 'extracted', textChars: result.extracted_text.length, truncated: !!result.truncated, uploading: false } : a))
           : prev
       );
     } catch (error) {
@@ -259,11 +277,15 @@ export default function ChatInterface({
 
   const attachmentsUploading = attachments.some((a) => a.uploading);
 
+  // At most one attachment is the prompt file; clicking it again clears it.
+  const togglePromptFile = (name) =>
+    setAttachments((prev) => prev.map((a) => ({ ...a, promptFile: a.name === name ? !a.promptFile : false })));
+
   const buildMessageContent = () => {
     const ready = attachments.filter((a) => a.content !== null);
     if (ready.length === 0) return input;
     const attachmentBlocks = ready
-      .map((a) => `**Attached file: ${a.name}**\n\`\`\`\n${a.content}\n\`\`\``)
+      .map((a) => `**Attached file: ${a.name}${a.promptFile ? ' [PROMPT FILE]' : ''}**\n\`\`\`\n${a.content}\n\`\`\``)
       .join('\n\n');
     return `${input}\n\n${attachmentBlocks}`;
   };
@@ -298,7 +320,13 @@ export default function ChatInterface({
         chairmanModelPayload(),
         toTokenOverride(councilMaxTokens),
         toTokenOverride(chairmanMaxTokens),
-        webMode
+        webMode,
+        {
+          ...buildRunPayload(runSettings),
+          attachment_meta: attachments
+            .filter((a) => a.content !== null)
+            .map((a) => ({ name: a.name, truncated: a.truncated ?? null, prompt_file: !!a.promptFile })),
+        }
       );
       setInput('');
       setAttachments([]);
@@ -331,7 +359,8 @@ export default function ChatInterface({
     }
 
     const s1 = msg.stage1 || [];
-    lines.push(`## Council health`, ``, ...healthLines(s1).map((l, i) => (i === 0 ? l : l)), ``);
+    lines.push(`## Council health`, ``, ...healthLines(s1, msg.stage2 || [], msg.stage3 || null), ``);
+    lines.push(`## Settings used`, ``, ...settingsTable(msg.metadata?.run_record));
     lines.push(
       (msg.metadata?.run_record?.web_search ?? msg.web_search)?.enabled
         ? `Web search was ON for stage 1; cited URLs and figures were not independently verified.`
@@ -576,6 +605,51 @@ export default function ChatInterface({
               400 if above a model's real max-output window.
             </div>
           </div>
+          <div className="run-settings">
+            <button
+              type="button"
+              className="run-settings-toggle"
+              onClick={() => setShowRunSettings((v) => !v)}
+              aria-expanded={showRunSettings}
+            >
+              {showRunSettings ? '▾' : '▸'} Token and reasoning limits
+            </button>
+            {showRunSettings && (
+              <div className="run-settings-body">
+                {SETTING_FIELDS.map((f) => (
+                  <label key={f.key} className="run-settings-field">
+                    <span className="run-settings-label">{f.label}</span>
+                    {REASONING_KEYS.includes(f.key) ? (
+                      <select
+                        value={runSettings[f.key]}
+                        onChange={(e) => setRunSettings((s) => ({ ...s, [f.key]: e.target.value }))}
+                      >
+                        {REASONING_OPTIONS.map((o) => (
+                          <option key={o} value={o}>{o}</option>
+                        ))}
+                      </select>
+                    ) : (
+                      <input
+                        type="number"
+                        min="1000"
+                        step="1000"
+                        value={runSettings[f.key]}
+                        onChange={(e) => setRunSettings((s) => ({ ...s, [f.key]: e.target.value }))}
+                      />
+                    )}
+                    <span className="run-settings-help">{f.help}</span>
+                  </label>
+                ))}
+                <button
+                  type="button"
+                  className="run-settings-reset"
+                  onClick={() => setRunSettings({ ...DEFAULT_RUN_SETTINGS })}
+                >
+                  Reset to defaults
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       )}
     </div>
@@ -718,6 +792,17 @@ export default function ChatInterface({
                 <span key={a.name} className={`attachment-chip${a.uploading ? ' attachment-chip-uploading' : ''}`}>
                   {a.name}
                   {a.uploading && <span className="attachment-chip-status"> — extracting…</span>}
+                  {!a.uploading && (
+                    <button
+                      type="button"
+                      className={`attachment-chip-prompt${a.promptFile ? ' attachment-chip-prompt-on' : ''}`}
+                      onClick={() => togglePromptFile(a.name)}
+                      disabled={isLoading}
+                      title="Mark this file as the instructions the council must follow"
+                    >
+                      {a.promptFile ? 'PROMPT FILE' : 'use as prompt'}
+                    </button>
+                  )}
                   <button
                     type="button"
                     className="attachment-chip-remove"
@@ -730,6 +815,29 @@ export default function ChatInterface({
               ))}
             </div>
           )}
+          {(() => {
+            const extracted = attachments.filter((a) => a.kind === 'extracted');
+            const extractedChars = extracted.reduce((n, a) => n + (a.textChars || 0), 0);
+            const cut = extracted.filter((a) => attachmentCutOff(a.textChars || 0, runSettings.max_office_extract_chars));
+            const seatsCap = seatsCapTokens(selectedSeats.length, runSettings.stage1_max_tokens);
+            return (
+              <div className="run-estimate">
+                <div>
+                  Estimated input per seat: about {estimateInputTokens(extractedChars, input.length).toLocaleString()} tokens
+                  {' '}(extracted chars + prompt chars) / 3.6
+                </div>
+                <div>Largest possible output per seat = {runSettings.stage1_max_tokens || 'server default'} tokens</div>
+                {selectedSeats.length > 0 && seatsCap !== null && (
+                  <div>Seats x cap = {selectedSeats.length} x {runSettings.stage1_max_tokens} = {seatsCap.toLocaleString()} tokens</div>
+                )}
+                {cut.map((a) => (
+                  <div key={a.name} className="cost-estimate-error">
+                    {a.name} is longer than the {runSettings.max_office_extract_chars}-character limit, so the end of it was cut off. Raise "Attachment extract chars" and attach it again.
+                  </div>
+                ))}
+              </div>
+            );
+          })()}
           {preflight && (
             <div className="preflight-panel">
               {preflight.error ? (

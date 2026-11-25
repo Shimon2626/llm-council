@@ -178,7 +178,8 @@ async def query_model(
     max_tokens: int = DEFAULT_MAX_TOKENS,
     reasoning_effort: str = "",
     web_search: bool = False,
-    error_log: Optional[List[Dict[str, Any]]] = None
+    error_log: Optional[List[Dict[str, Any]]] = None,
+    retry_ceiling: Optional[int] = None
 ) -> Optional[Dict[str, Any]]:
     """
     Query one council seat, trying providers in order until one succeeds.
@@ -196,6 +197,9 @@ async def query_model(
         max_tokens: Completion token cap, forwarded to the provider.
         error_log: optional list that receives one dict per failed provider
             attempt: provider, model, attempt, error, http_status, body.
+        retry_ceiling: per-run ceiling for the doubled retry cap; None uses
+            RETRY_MAX_TOKENS_CEILING. A first cap already at or above it gets
+            no retry (the doubling never exceeds the ceiling).
 
     Returns:
         Response dict with 'content', 'reasoning_details', 'provider', and
@@ -206,6 +210,7 @@ async def query_model(
         model_spec = {"openrouter": model_spec}
     model_spec = _with_paid_fallback(model_spec)
 
+    ceiling = RETRY_MAX_TOKENS_CEILING if retry_ceiling is None else retry_ceiling
     soft_failure = None  # an answer that arrived but was empty/cut off
     spent = {'prompt_tokens': 0, 'completion_tokens': 0, 'reasoning_tokens': 0}  # billed across retries
     for provider in PROVIDER_ORDER:
@@ -246,7 +251,7 @@ async def query_model(
                   f"(finish_reason={result.get('finish_reason')}, cap={cap}, attempt={attempt})")
             if soft_failure is None or (soft_failure['empty'] and not result['empty']):
                 soft_failure = result
-            bigger = min(cap * 2, RETRY_MAX_TOKENS_CEILING)
+            bigger = min(cap * 2, ceiling)
             if attempt == 1 and result.get('finish_reason') == 'length' and bigger > cap:
                 cap = bigger  # one retry with more room
                 continue
@@ -265,7 +270,8 @@ async def query_models_parallel(
     reasoning_effort: str = "",
     web_search: bool = False,
     error_logs: Optional[Dict[str, List[Dict[str, Any]]]] = None,
-    progress: Optional[Dict[str, int]] = None
+    progress: Optional[Dict[str, int]] = None,
+    retry_ceiling: Optional[int] = None
 ) -> Dict[str, Optional[Dict[str, Any]]]:
     """
     Query multiple council seats in parallel, each with its own fallback chain.
@@ -297,7 +303,8 @@ async def query_models_parallel(
         try:
             return await query_model(
                 spec, messages, max_tokens=effective_max_tokens, reasoning_effort=reasoning_effort,
-                web_search=web_search, error_log=None if error_logs is None else error_logs[label])
+                web_search=web_search, error_log=None if error_logs is None else error_logs[label],
+                retry_ceiling=retry_ceiling)
         finally:
             if progress is not None:
                 progress["done"] = progress.get("done", 0) + 1

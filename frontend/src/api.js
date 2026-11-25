@@ -147,8 +147,9 @@ export const api = {
     return postFile('/api/extract-docx', file, 'Failed to extract docx file');
   },
 
-  extractOffice(file) {
-    return postFile('/api/extract-office', file, 'Failed to extract Office file');
+  extractOffice(file, maxChars) {
+    const q = maxChars ? `?max_chars=${encodeURIComponent(maxChars)}` : '';
+    return postFile(`/api/extract-office${q}`, file, 'Failed to extract Office file');
   },
 
   /**
@@ -219,7 +220,7 @@ export const api = {
    * @param {function} onEvent - Callback function for each event: (eventType, data) => void
    * @returns {Promise<void>}
    */
-  async sendMessageStream(conversationId, content, onEvent, councilModels, chairmanModel, councilMaxTokens, chairmanMaxTokens, signal, webSearch) {
+  async sendMessageStream(conversationId, content, onEvent, councilModels, chairmanModel, councilMaxTokens, chairmanMaxTokens, signal, webSearch, runSettings = {}) {
     const response = await fetch(
       `${API_BASE}/api/conversations/${conversationId}/message/stream`,
       {
@@ -234,6 +235,7 @@ export const api = {
           council_max_tokens: councilMaxTokens,
           chairman_max_tokens: chairmanMaxTokens,
           web_search: webSearch,
+          ...runSettings,
         }),
         signal,
       }

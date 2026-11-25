@@ -20,6 +20,7 @@ from . import config
 from . import pricing
 from . import openrouter_catalog
 from .preflight import build_preflight, missing_message, run_record
+from .run_settings import resolve_settings, parse_int, parse_reasoning, clamp, HARD_MAX_CHARS
 from .council import run_full_council, generate_conversation_title, stage1_collect_responses, stage2_collect_rankings, stage3_synthesize_final, calculate_aggregate_rankings
 
 # Zip-upload extraction limits (backend/main.py's /api/extract-zip).
@@ -44,7 +45,9 @@ MAX_DOCX_EXTRACT_CHARS = 100_000
 # text lives under (word/document.xml's <w:p> paragraphs / <w:t> runs).
 DOCX_WORD_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 
-MAX_OFFICE_EXTRACT_CHARS = MAX_DOCX_EXTRACT_CHARS
+# Raised 2026-11-25: the T6 formulas workbook extracts to ~170k chars. The old
+# 100k cap cut it mid row 38 and dropped the "Read me" sheet.
+MAX_OFFICE_EXTRACT_CHARS = int(os.getenv("COUNCIL_MAX_OFFICE_EXTRACT_CHARS", "400000"))
 XLSX_MAIN_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 PPTX_DRAWING_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
 
@@ -135,6 +138,7 @@ class CreateConversationRequest(BaseModel):
 
 class _ContentRequest(BaseModel):
     content: str
+    attachment_meta: Optional[List[Dict[str, Any]]] = None
 
     @field_validator("content")
     @classmethod
@@ -157,6 +161,43 @@ class SendMessageRequest(_ContentRequest):
     chairman_max_tokens: Optional[int] = None
     # "auto" (default), "on" or "off" - see backend/web_search.py
     web_search: Optional[str] = None
+    # Optional per-run overrides (absent/null = env default). Parsed and clamped
+    # by backend/run_settings.py; a non-integer is a 422 with a clear message.
+    stage1_max_tokens: Optional[Any] = None
+    retry_max_tokens_ceiling: Optional[Any] = None
+    stage1_reasoning_effort: Optional[Any] = None
+    chairman_reasoning_effort: Optional[Any] = None
+    stage2_max_tokens: Optional[Any] = None
+    max_office_extract_chars: Optional[Any] = None
+
+    @field_validator("council_max_tokens", "chairman_max_tokens", mode="before")
+    @classmethod
+    def _legacy_tokens_whole(cls, v, info):
+        return parse_int(v, info.field_name)
+
+    @field_validator("stage1_max_tokens", "retry_max_tokens_ceiling", "stage2_max_tokens",
+                     "max_office_extract_chars", mode="before")
+    @classmethod
+    def _override_whole_number(cls, v, info):
+        return parse_int(v, info.field_name)
+
+    @field_validator("stage1_reasoning_effort", "chairman_reasoning_effort", mode="before")
+    @classmethod
+    def _override_reasoning(cls, v, info):
+        return parse_reasoning(v, info.field_name)
+
+    def effective_settings(self) -> Dict[str, Any]:
+        return resolve_settings(
+            stage1_max_tokens=self.stage1_max_tokens,
+            retry_max_tokens_ceiling=self.retry_max_tokens_ceiling,
+            stage1_reasoning_effort=self.stage1_reasoning_effort,
+            chairman_reasoning_effort=self.chairman_reasoning_effort,
+            stage2_max_tokens=self.stage2_max_tokens,
+            chairman_max_tokens=self.chairman_max_tokens,
+            max_office_extract_chars=self.max_office_extract_chars,
+            legacy_council_max_tokens=self.council_max_tokens,
+            extract_default=MAX_OFFICE_EXTRACT_CHARS,
+        )
 
 
 class EstimateCostRequest(_ContentRequest):
@@ -335,7 +376,7 @@ def _xlsx_sheets(zf: zipfile.ZipFile, names: set):
     return [(f, f) for f in files]
 
 
-def _xlsx_to_text(zf: zipfile.ZipFile, names: set) -> str:
+def _xlsx_to_text(zf: zipfile.ZipFile, names: set, cap: int = MAX_OFFICE_EXTRACT_CHARS) -> str:
     """Sheet-by-sheet tab-separated text from an .xlsx's XML parts."""
     shared = []
     if "xl/sharedStrings.xml" in names:
@@ -360,15 +401,15 @@ def _xlsx_to_text(zf: zipfile.ZipFile, names: set) -> str:
                 line = "\t".join(cells)
                 rows.append(line)
                 total += len(line)
-            if total > MAX_OFFICE_EXTRACT_CHARS:
+            if total > cap:
                 break
         parts.append(f"--- Sheet: {sheet_name} ---\n" + "\n".join(rows))
-        if total > MAX_OFFICE_EXTRACT_CHARS:
+        if total > cap:
             break
     return "\n\n".join(parts)
 
 
-def _pptx_to_text(zf: zipfile.ZipFile, names: set) -> str:
+def _pptx_to_text(zf: zipfile.ZipFile, names: set, cap: int = MAX_OFFICE_EXTRACT_CHARS) -> str:
     """Slide-by-slide text from a .pptx's XML parts."""
     slides = sorted((n for n in names if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)), key=_natural_key)
     parts, total = [], 0
@@ -381,12 +422,12 @@ def _pptx_to_text(zf: zipfile.ZipFile, names: set) -> str:
         body = "\n".join(p for p in paras if p)
         parts.append(f"--- Slide {n} ---\n{body}")
         total += len(body)
-        if total > MAX_OFFICE_EXTRACT_CHARS:
+        if total > cap:
             break
     return "\n\n".join(parts)
 
 
-def _extract_office_text(raw: bytes, filename: str) -> str:
+def _extract_office_text(raw: bytes, filename: str, cap: int = MAX_OFFICE_EXTRACT_CHARS) -> str:
     """Blocking zip/XML work, run via asyncio.to_thread. Raises ValueError for a bad or oversized file."""
     lower = filename.lower()
     if not lower.endswith((".xlsx", ".pptx")):
@@ -396,26 +437,31 @@ def _extract_office_text(raw: bytes, filename: str) -> str:
         if sum(i.file_size for i in zf.infolist()) > MAX_OFFICE_UNCOMPRESSED_BYTES:
             raise ValueError(f"{filename!r} expands to more than {MAX_OFFICE_UNCOMPRESSED_BYTES // (1024 * 1024)} MB")
         names = set(zf.namelist())
-        return _xlsx_to_text(zf, names) if lower.endswith(".xlsx") else _pptx_to_text(zf, names)
+        return _xlsx_to_text(zf, names, cap) if lower.endswith(".xlsx") else _pptx_to_text(zf, names, cap)
     except (zipfile.BadZipFile, KeyError, ET.ParseError):
         raise ValueError(f"Could not read {filename!r} as an Office file")
 
 
 @app.post("/api/extract-office")
-async def extract_office(file: UploadFile = File(...)):
+async def extract_office(file: UploadFile = File(...), max_chars: Optional[str] = None):
     """Extracts readable text from an uploaded .xlsx or .pptx (zip of XML
     parts, stdlib only). Same reason as /api/extract-docx: readAsText on
     these returns raw zip bytes, which reached the council as garbage."""
+    try:
+        asked = parse_int(max_chars, "max_chars")
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    cap = clamp(asked, HARD_MAX_CHARS) if asked is not None else MAX_OFFICE_EXTRACT_CHARS
     raw = await file.read()
     if len(raw) > MAX_OFFICE_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail=f"{file.filename!r} is larger than {MAX_OFFICE_UPLOAD_BYTES // (1024 * 1024)} MB")
     try:
-        text = await asyncio.to_thread(_extract_office_text, raw, file.filename or "")
+        text = await asyncio.to_thread(_extract_office_text, raw, file.filename or "", cap)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    truncated = len(text) > MAX_OFFICE_EXTRACT_CHARS
-    return {"extracted_text": text[:MAX_OFFICE_EXTRACT_CHARS], "truncated": truncated}
+    truncated = len(text) > cap
+    return {"extracted_text": text[:cap], "truncated": truncated, "cap": cap}
 
 
 @app.get("/api/config/status")
@@ -544,13 +590,18 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
         storage.update_conversation_title(conversation_id, title)
 
     # Run the 3-stage council process
+    settings = request.effective_settings()
     stage1_results, stage2_results, stage3_result, metadata = await run_full_council(
         request.content, request.council_models, request.chairman_model,
-        request.council_max_tokens, request.chairman_max_tokens,
-        resolve_web_search(request.web_search, request.content)["enabled"]
+        settings["stage1_max_tokens"], settings["chairman_max_tokens"],
+        resolve_web_search(request.web_search, request.content)["enabled"],
+        stage2_max_tokens=settings["stage2_max_tokens"],
+        retry_ceiling=settings["retry_max_tokens_ceiling"],
+        stage1_reasoning_effort=settings["stage1_reasoning_effort"],
+        chairman_reasoning_effort=settings["chairman_reasoning_effort"],
     )
 
-    metadata["run_record"] = run_record(request.content, resolve_web_search(request.web_search, request.content))
+    metadata["run_record"] = run_record(request.content, resolve_web_search(request.web_search, request.content), settings, request.attachment_meta)
 
     # Add assistant message with all stages
     storage.add_assistant_message(
@@ -602,12 +653,13 @@ async def send_message_stream(conversation_id: str, body: SendMessageRequest, ht
             # moment stage 3 finishes — see the cost_complete event below.
             cost_log = []
             web = resolve_web_search(body.web_search, body.content)
+            settings = body.effective_settings()
 
             # Stage 1: Collect responses
             yield f"data: {json.dumps({'type': 'stage1_start', 'web_search': web})}\n\n"
             stage1_results = None
             progress1 = {"done": 0, "total": 0}
-            async for item in _run_with_heartbeat(stage1_collect_responses(body.content, body.council_models, body.council_max_tokens, cost_log, web["enabled"], progress1), http_request, progress=progress1):
+            async for item in _run_with_heartbeat(stage1_collect_responses(body.content, body.council_models, settings["stage1_max_tokens"], cost_log, web["enabled"], progress1, reasoning_effort=settings["stage1_reasoning_effort"], retry_ceiling=settings["retry_max_tokens_ceiling"]), http_request, progress=progress1):
                 if item is None:
                     yield ": heartbeat\n\n"
                 elif isinstance(item, StageProgress):
@@ -620,7 +672,7 @@ async def send_message_stream(conversation_id: str, body: SendMessageRequest, ht
             yield f"data: {json.dumps({'type': 'stage2_start'})}\n\n"
             stage2_result_pair = None
             progress2 = {"done": 0, "total": 0}
-            async for item in _run_with_heartbeat(stage2_collect_rankings(body.content, stage1_results, body.council_models, body.council_max_tokens, cost_log, progress2), http_request, progress=progress2):
+            async for item in _run_with_heartbeat(stage2_collect_rankings(body.content, stage1_results, body.council_models, None, cost_log, progress2, stage2_max_tokens=settings["stage2_max_tokens"], retry_ceiling=settings["retry_max_tokens_ceiling"]), http_request, progress=progress2):
                 if item is None:
                     yield ": heartbeat\n\n"
                 elif isinstance(item, StageProgress):
@@ -629,12 +681,12 @@ async def send_message_stream(conversation_id: str, body: SendMessageRequest, ht
                     stage2_result_pair = item
             stage2_results, label_to_model = stage2_result_pair
             aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
-            yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings, 'run_record': run_record(body.content, web)}})}\n\n"
+            yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings, 'run_record': run_record(body.content, web, settings, body.attachment_meta)}})}\n\n"
 
             # Stage 3: Synthesize final answer
             yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
             stage3_result = None
-            async for item in _run_with_heartbeat(stage3_synthesize_final(body.content, stage1_results, stage2_results, body.chairman_model, body.chairman_max_tokens, cost_log, web["enabled"]), http_request):
+            async for item in _run_with_heartbeat(stage3_synthesize_final(body.content, stage1_results, stage2_results, body.chairman_model, settings["chairman_max_tokens"], cost_log, web["enabled"], retry_ceiling=settings["retry_max_tokens_ceiling"], reasoning_effort=settings["chairman_reasoning_effort"]), http_request):
                 if item is None:
                     yield ": heartbeat\n\n"
                 else:
@@ -664,7 +716,7 @@ async def send_message_stream(conversation_id: str, body: SendMessageRequest, ht
                 stage2_results,
                 stage3_result,
                 actual_cost,
-                {"label_to_model": label_to_model, "aggregate_rankings": aggregate_rankings, "run_record": run_record(body.content, web)}
+                {"label_to_model": label_to_model, "aggregate_rankings": aggregate_rankings, "run_record": run_record(body.content, web, settings, body.attachment_meta)}
             )
 
             # Send completion event
