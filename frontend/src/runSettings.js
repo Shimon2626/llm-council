@@ -82,8 +82,10 @@ export function seatsCapTokens(seatCount, stage1MaxTokens) {
   return n === null ? null : seatCount * n;
 }
 
-// The extractor leaves no marker in the text, so reaching the cap is the signal.
-export function attachmentCutOff(textChars, cap) {
+// The extractor's boolean `truncated` flag is authoritative. Only when it is
+// missing does reaching the cap act as the fallback signal.
+export function attachmentCutOff(textChars, cap, truncated) {
+  if (typeof truncated === 'boolean') return truncated;
   const c = toInt(cap);
   return c !== null && textChars >= c;
 }

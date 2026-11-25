@@ -48,3 +48,18 @@ test('estimates and cut-off helper', () => {
   assert.equal(attachmentCutOff(400000, 400000), true);
   assert.equal(attachmentCutOff(399999, 400000), false);
 });
+
+test('attachmentCutOff: flag true wins over a short text', () => {
+  assert.equal(attachmentCutOff(100, 400000, true), true);
+});
+
+test('attachmentCutOff: flag false wins over a long text', () => {
+  assert.equal(attachmentCutOff(400000, 400000, false), false);
+  assert.equal(attachmentCutOff(500000, 400000, false), false);
+});
+
+test('attachmentCutOff: missing flag falls back to the length heuristic', () => {
+  assert.equal(attachmentCutOff(400000, 400000, undefined), true);
+  assert.equal(attachmentCutOff(399999, 400000, null), false);
+  assert.equal(attachmentCutOff(400000, 400000), true);
+});

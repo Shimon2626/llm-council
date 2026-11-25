@@ -818,7 +818,7 @@ export default function ChatInterface({
           {(() => {
             const extracted = attachments.filter((a) => a.kind === 'extracted');
             const extractedChars = extracted.reduce((n, a) => n + (a.textChars || 0), 0);
-            const cut = extracted.filter((a) => attachmentCutOff(a.textChars || 0, runSettings.max_office_extract_chars));
+            const cut = extracted.filter((a) => attachmentCutOff(a.textChars || 0, runSettings.max_office_extract_chars, a.truncated));
             const seatsCap = seatsCapTokens(selectedSeats.length, runSettings.stage1_max_tokens);
             return (
               <div className="run-estimate">
