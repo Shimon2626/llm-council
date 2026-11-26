@@ -67,7 +67,13 @@ async def estimate_cost(
     user_query: str,
     council_models: List[Dict[str, str]],
     chairman_model: Dict[str, str],
-    web_search: bool = False
+    web_search: bool = False,
+    stage1_max_tokens: Optional[int] = None,
+    stage2_max_tokens: Optional[int] = None,
+    chairman_max_tokens: Optional[int] = None,
+    stage1_reasoning_effort: Optional[str] = None,
+    chairman_reasoning_effort: Optional[str] = None,
+    priced_for: Optional[str] = None,
 ) -> Dict:
     """
     Worst-case cost estimate for one council run, assuming every model uses
@@ -79,6 +85,10 @@ async def estimate_cost(
     pricing = await _get_openrouter_pricing()
     query_tokens = _estimate_tokens(user_query)
     num_seats = len(council_models)
+    s1_cap = stage1_max_tokens or DEFAULT_MAX_TOKENS
+    s2_cap = stage2_max_tokens or STAGE2_MAX_TOKENS
+    ch_cap = chairman_max_tokens or CHAIRMAN_MAX_TOKENS
+    seat_rows = []
 
     breakdown = []
     total = 0.0
@@ -94,7 +104,10 @@ async def estimate_cost(
         model = _priced_model(seat)
         if not model:
             continue  # NVIDIA-only seat, no fallback path — guaranteed free
-        c = cost_for(model, query_tokens, DEFAULT_MAX_TOKENS)
+        c = cost_for(model, query_tokens, s1_cap)
+        rates = pricing.get(model) or {"prompt": 0.0, "completion": 0.0}
+        seat_rows.append({"model": model, "input_cost_usd": round(rates["prompt"] * query_tokens, 6),
+                          "max_output_cost_usd": round(rates["completion"] * s1_cap, 6)})
         if c:
             breakdown.append({"stage": 1, "provider": "openrouter", "model": model, "cost_usd": round(c, 4)})
             total += c
@@ -107,21 +120,26 @@ async def estimate_cost(
 
     # Stage 2: each seat re-runs on a ranking prompt containing every stage1
     # response — worst case, every seat used its full stage1 budget.
-    stage2_input_estimate = query_tokens + num_seats * DEFAULT_MAX_TOKENS
+    stage2_input_estimate = query_tokens + num_seats * s1_cap
     for seat in council_models:
         model = _priced_model(seat)
         if not model:
             continue
-        c = cost_for(model, stage2_input_estimate, STAGE2_MAX_TOKENS)
+        c = cost_for(model, stage2_input_estimate, s2_cap)
         if c:
             breakdown.append({"stage": 2, "provider": "openrouter", "model": model, "cost_usd": round(c, 4)})
             total += c
 
     # Stage 3: Chairman sees every stage1 response + every stage2 ranking.
     chairman_priced_model = _priced_model(chairman_model)
+    chairman_row = None
     if chairman_priced_model:
-        stage3_input_estimate = query_tokens + 2 * num_seats * DEFAULT_MAX_TOKENS
-        c = cost_for(chairman_priced_model, stage3_input_estimate, CHAIRMAN_MAX_TOKENS)
+        stage3_input_estimate = query_tokens + 2 * num_seats * s1_cap
+        c = cost_for(chairman_priced_model, stage3_input_estimate, ch_cap)
+        crates = pricing.get(chairman_priced_model) or {"prompt": 0.0, "completion": 0.0}
+        chairman_row = {"model": chairman_priced_model,
+                        "input_cost_usd": round(crates["prompt"] * stage3_input_estimate, 6),
+                        "max_output_cost_usd": round(crates["completion"] * ch_cap, 6)}
         if c:
             breakdown.append({"stage": 3, "provider": "openrouter", "model": chairman_priced_model, "cost_usd": round(c, 4)})
             total += c
@@ -129,6 +147,12 @@ async def estimate_cost(
     return {
         "estimated_cost_usd": round(total, 4),
         "breakdown": breakdown,
+        "seats": seat_rows,
+        "chairman": chairman_row,
+        "includes_stage2": True,
+        "caps": {"stage1_max_tokens": s1_cap, "stage2_max_tokens": s2_cap, "chairman_max_tokens": ch_cap},
+        "reasoning": {"stage1": stage1_reasoning_effort, "chairman": chairman_reasoning_effort},
+        "priced_for": priced_for,
         "note": (
             "Upper-bound estimate: assumes every model uses its full max_tokens "
             "budget and ~4 chars/token. Seats with only an NVIDIA model (no "

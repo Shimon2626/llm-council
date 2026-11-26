@@ -89,3 +89,29 @@ export function attachmentCutOff(textChars, cap, truncated) {
   const c = toInt(cap);
   return c !== null && textChars >= c;
 }
+
+// Rows for the estimate block: one per seat, then the chairman. `est` is the
+// /api/estimate-cost response.
+export function estimateRows(est) {
+  if (!est || !Array.isArray(est.seats)) return [];
+  const row = (role, r) => ({
+    role,
+    model: r.model,
+    input: `$${Number(r.input_cost_usd).toFixed(4)}`,
+    output: `$${Number(r.max_output_cost_usd).toFixed(4)}`,
+  });
+  const rows = est.seats.map((r) => row('seat', r));
+  if (est.chairman) rows.push(row('chairman', est.chairman));
+  return rows;
+}
+
+// A run needs at least one seat and a chairman. An empty selection means "use
+// the server default", so `defaults` ({seats, chairman}) says whether that
+// default is itself complete. `defaults` undefined = unknown, assume complete.
+export function councilReady(selectedSeats, selectedChairman, defaults) {
+  const picked = Boolean(selectedSeats && selectedSeats.length);
+  if (!picked && !selectedChairman && defaults === undefined) return true;
+  const seats = picked ? selectedSeats : defaults && defaults.seats;
+  const chairman = selectedChairman || (defaults && defaults.chairman);
+  return Boolean(seats && seats.length > 0 && chairman);
+}

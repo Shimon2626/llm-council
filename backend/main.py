@@ -146,14 +146,10 @@ class _ContentRequest(BaseModel):
         return _reject_binary_content(v)
 
 
-class SendMessageRequest(_ContentRequest):
-    """Request to send a message in a conversation."""
+class _RunOverrides(BaseModel):
+    """Per-run caps, reasoning and web mode: shared by a run and its cost estimate
+    so the estimate prices exactly what a run would use."""
 
-    # Optional per-request overrides — each a single-provider spec like
-    # {"nvidia": "meta/llama-3.1-70b-instruct"} or {"openrouter": "openai/gpt-5.1"}.
-    # If omitted, falls back to config.COUNCIL_MODELS / config.CHAIRMAN_MODEL.
-    council_models: Optional[List[Dict[str, str]]] = None
-    chairman_model: Optional[Dict[str, str]] = None
     # Optional per-request completion token cap overrides. If omitted, falls
     # back to openrouter.DEFAULT_MAX_TOKENS / CHAIRMAN_MAX_TOKENS (themselves
     # .env-configurable). No provider accepts a literal "unlimited" value.
@@ -200,12 +196,22 @@ class SendMessageRequest(_ContentRequest):
         )
 
 
-class EstimateCostRequest(_ContentRequest):
+class SendMessageRequest(_ContentRequest, _RunOverrides):
+    """Request to send a message in a conversation."""
+
+    # Optional per-request overrides — each a single-provider spec like
+    # {"nvidia": "meta/llama-3.1-70b-instruct"} or {"openrouter": "openai/gpt-5.1"}.
+    # If omitted, falls back to config.COUNCIL_MODELS / config.CHAIRMAN_MODEL.
+    council_models: Optional[List[Dict[str, str]]] = None
+    chairman_model: Optional[Dict[str, str]] = None
+
+
+
+class EstimateCostRequest(_ContentRequest, _RunOverrides):
     """Request to estimate the cost of a council run before sending it."""
 
     council_models: Optional[List[Dict[str, str]]] = None
     chairman_model: Optional[Dict[str, str]] = None
-    web_search: Optional[str] = None
 
 
 class PreflightRequest(_ContentRequest):
@@ -537,7 +543,21 @@ async def estimate_cost(request: EstimateCostRequest):
     council_models = request.council_models or config.COUNCIL_MODELS
     chairman_model = request.chairman_model or config.CHAIRMAN_MODEL
     web = resolve_web_search(request.web_search, request.content)
-    result = await pricing.estimate_cost(request.content, council_models, chairman_model, web["enabled"])
+    if not council_models or not chairman_model:
+        raise HTTPException(status_code=422, detail="No models selected")
+    settings = request.effective_settings()
+    explicit = bool(request.council_models and request.chairman_model)
+    label = (f"selected council ({len(council_models)} seats + chairman)" if explicit
+             else f"default council ({len(council_models)} seats + chairman)")
+    result = await pricing.estimate_cost(
+        request.content, council_models, chairman_model, web["enabled"],
+        stage1_max_tokens=settings["stage1_max_tokens"],
+        stage2_max_tokens=settings["stage2_max_tokens"],
+        chairman_max_tokens=settings["chairman_max_tokens"],
+        stage1_reasoning_effort=settings["stage1_reasoning_effort"],
+        chairman_reasoning_effort=settings["chairman_reasoning_effort"],
+        priced_for=label,
+    )
     result["web_search"] = web
     return result
 

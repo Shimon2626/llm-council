@@ -2,6 +2,8 @@
  * API client for the LLM Council backend.
  */
 
+import { buildRunPayload } from './runSettings.js';
+
 // Dev (vite) talks to the backend directly; a production build is served from
 // the same hostname as the API (nginx proxies /api), so the base is empty.
 const API_BASE = import.meta.env.DEV ? 'http://localhost:8001' : '';
@@ -74,7 +76,7 @@ export const api = {
   /**
    * Estimate the worst-case USD cost of a council run before sending it.
    */
-  async estimateCost(content, councilModels, chairmanModel, webSearch) {
+  async estimateCost(content, councilModels, chairmanModel, webSearch, runSettings = {}) {
     const response = await fetch(`${API_BASE}/api/estimate-cost`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -83,6 +85,7 @@ export const api = {
         council_models: councilModels,
         chairman_model: chairmanModel,
         web_search: webSearch,
+        ...buildRunPayload(runSettings),
       }),
     });
     if (!response.ok) {

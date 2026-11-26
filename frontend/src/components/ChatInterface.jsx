@@ -18,6 +18,8 @@ import {
   estimateInputTokens,
   seatsCapTokens,
   attachmentCutOff,
+  estimateRows,
+  councilReady,
 } from '../runSettings';
 import './ChatInterface.css';
 
@@ -87,7 +89,9 @@ export default function ChatInterface({
   // previous cost estimate — it no longer reflects what would actually run.
   useEffect(() => {
     setCostEstimate(null);
-  }, [input, attachments, selectedSeats, selectedChairman]);
+  }, [input, attachments, selectedSeats, selectedChairman, runSettings]);
+
+  const ready = councilReady(selectedSeats, selectedChairman);
 
   const toggleSeat = (provider, model) => {
     setSelectedSeats((prev) => {
@@ -172,11 +176,11 @@ export default function ChatInterface({
     try {
       await runPreflight();
       const content = buildMessageContent();
-      const result = await api.estimateCost(content, councilModelsPayload(), chairmanModelPayload(), webMode);
+      const result = await api.estimateCost(content, councilModelsPayload(), chairmanModelPayload(), webMode, runSettings);
       setCostEstimate(result);
     } catch (e) {
       console.error('Cost estimate failed:', e);
-      setCostEstimate({ error: true });
+      setCostEstimate({ error: true, message: e.message });
     } finally {
       setEstimating(false);
     }
@@ -902,7 +906,7 @@ export default function ChatInterface({
               type="button"
               className="estimate-button"
               onClick={handleEstimateCost}
-              disabled={(!input.trim() && attachments.length === 0) || isLoading || estimating || attachmentsUploading}
+              disabled={(!input.trim() && attachments.length === 0) || isLoading || estimating || attachmentsUploading || !ready}
               title="Estimate worst-case cost before sending"
             >
               {estimating ? '…' : '💲 Estimate'}
@@ -910,21 +914,51 @@ export default function ChatInterface({
             <button
               type="submit"
               className="send-button"
-              disabled={(!input.trim() && attachments.length === 0) || isLoading || attachmentsUploading}
+              disabled={(!input.trim() && attachments.length === 0) || isLoading || attachmentsUploading || !ready}
             >
               Send
             </button>
           </div>
 
+          {!ready && (
+            <div className="cost-estimate-row">
+              <span className="cost-estimate-error">No models selected</span>
+            </div>
+          )}
+
           {costEstimate && (
             <div className="cost-estimate-row">
               {costEstimate.error ? (
-                <span className="cost-estimate-error">Could not estimate cost.</span>
+                <span className="cost-estimate-error">{costEstimate.message || 'Could not estimate cost.'}</span>
               ) : (
                 <>
                   <span className="cost-estimate-total">
                     Estimated max cost: ${costEstimate.estimated_cost_usd.toFixed(4)}
                   </span>
+                  {costEstimate.priced_for && (
+                    <span className="cost-estimate-note">Priced for: {costEstimate.priced_for}</span>
+                  )}
+                  {estimateRows(costEstimate).length > 0 && (
+                    <table className="preflight-table">
+                      <thead>
+                        <tr><th>Role</th><th>Model</th><th>Input</th><th>Max output</th></tr>
+                      </thead>
+                      <tbody>
+                        {estimateRows(costEstimate).map((r) => (
+                          <tr key={`${r.role}-${r.model}`}>
+                            <td>{r.role}</td><td>{r.model}</td><td>{r.input}</td><td>{r.output}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                  {costEstimate.caps && (
+                    <span className="cost-estimate-note">
+                      Caps: stage 1 {costEstimate.caps.stage1_max_tokens}, stage 2 {costEstimate.caps.stage2_max_tokens}
+                      {costEstimate.includes_stage2 ? ' (included)' : ' (not included)'}, chairman {costEstimate.caps.chairman_max_tokens}
+                      {costEstimate.reasoning && ` · reasoning: stage 1 ${costEstimate.reasoning.stage1}, chairman ${costEstimate.reasoning.chairman}`}
+                    </span>
+                  )}
                   <span className="cost-estimate-note">{costEstimate.note}</span>
                   {costEstimate.web_search && (
                     <span className="cost-estimate-note">
