@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { previewAttachments, attachmentPreviewBlocks, typedPrompt, attachmentTable, healthLines, seatTable } from '../src/reportText.js';
+import { previewAttachments, attachmentPreviewBlocks, typedPrompt, attachmentTable, healthLines, seatTable, settingsTable, reasoningShare } from '../src/reportText.js';
 
 const q = `\n\n**Attached file: Plan.docx**\n\`\`\`\n${'x'.repeat(1000)}\n\`\`\``;
 
@@ -45,7 +45,7 @@ test('health lists failures with reason, replacement, duplicates and non-complia
 
 test('seat table shows finish_reason, tokens and duration, null shown as null', () => {
   const t = seatTable([{ seat: 's', model: 'm', status: 'error', finish_reason: null, completion_tokens: 0, duration_s: null }]).join('\n');
-  assert.match(t, /\| s \| m \| error \| null \| \? \| 0 \| 0 \| \? \| \? \|/);
+  assert.match(t, /\| s \| m \| error \| null \| \? \| 0 \| 0 \| n\/a \| \? \| \? \|/);
 });
 
 test('attachmentPreviewBlocks returns only the labelled previews', () => {
@@ -85,4 +85,38 @@ test('no attachment: topic is used, made file-safe, with date and time', () => {
 test('no attachment and no usable topic falls back to "report"', () => {
   assert.equal(reportFileName('x', 'New Conversation', NOW), 'LLM-Council-report_20261116_1405.md');
   assert.equal(reportFileName('x', undefined, NOW), 'LLM-Council-report_20261116_1405.md');
+});
+
+test('reasoning share is reasoning/completion to one decimal, n/a when no completion', () => {
+  assert.equal(reasoningShare({ completion_tokens: 8, reasoning_tokens: 1 }), '12.5%');
+  assert.equal(reasoningShare({ completion_tokens: 0, reasoning_tokens: 5 }), 'n/a');
+});
+
+test('health flags stage 2 and stage 3 truncation', () => {
+  const s1 = [{ seat: 'a', model: 'a', status: 'ok', finish_reason: 'stop' }];
+  const t = healthLines(s1, [{ model: 'r1', truncated: true, finish_reason: 'length' }], { model: 'chair', finish_reason: 'length' }).join('\n');
+  assert.match(t, /STAGE 2 CUT OFF: 1 of 1/);
+  assert.match(t, /Chairman output was cut off; the merged table is incomplete\./);
+  const ok = healthLines(s1, [{ model: 'r1', finish_reason: 'stop' }], { model: 'chair', finish_reason: 'stop' }).join('\n');
+  assert.ok(!/CUT OFF:/.test(ok));
+});
+
+test('settings table lists the six values and clamps; attachments show cap and CUT OFF', () => {
+  const rec = { settings: { stage1_max_tokens: 40000, retry_max_tokens_ceiling: 64000, stage1_reasoning_effort: '', chairman_reasoning_effort: 'high', stage2_max_tokens: 12000, chairman_max_tokens: 40000, max_office_extract_chars: 400000, clamped: ['stage1_max_tokens: 999999 -> 128000'] } };
+  const t = settingsTable(rec).join('\n');
+  assert.match(t, /Stage 1 max tokens per seat \| 40000/);
+  assert.match(t, /default \(none sent\)/);
+  assert.match(t, /Chairman reasoning effort \| high/);
+  assert.match(t, /Clamped to limits: stage1_max_tokens/);
+  const a = attachmentTable({ attachments: [{ name: 'p.docx', text_chars: 400000, text_sha256: 'h', cap: 400000, cut_off: true }] }).join('\n');
+  assert.match(a, /p\.docx, 400000 chars, cap 400000, CUT OFF yes/);
+});
+
+test('PROMPT FILE marker keeps the name clean and shows in the table', async () => {
+  const { attachmentPreviewBlocks, attachmentTable } = await import('../src/reportText.js');
+  const q = 'typed\n\n**Attached file: P.docx [PROMPT FILE]**\n```\nbody\n```';
+  assert.match(attachmentPreviewBlocks(q), /P\.docx \[PROMPT FILE\]/);
+  const t = attachmentTable({ attachments: [{ name: 'P.docx', text_chars: 4, text_sha256: 'x', cap: 9, cut_off: true, cut_off_source: 'extractor', prompt_file: true }] }).join('\n');
+  assert.match(t, /PROMPT FILE/);
+  assert.match(t, /CUT OFF yes \(extractor flag\)/);
 });

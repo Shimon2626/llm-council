@@ -9,6 +9,7 @@ silently under/over-estimate.
 import httpx
 from typing import Dict, List, Optional
 from .config import PROVIDERS
+from . import openrouter_catalog
 from .web_search import WEB_MAX_RESULTS, WEB_COST_PER_RESULT_USD
 from .openrouter import DEFAULT_MAX_TOKENS, STAGE2_MAX_TOKENS, CHAIRMAN_MAX_TOKENS
 
@@ -27,6 +28,7 @@ async def _get_openrouter_pricing() -> Dict[str, Dict[str, float]]:
         response.raise_for_status()
         data = response.json()
 
+    openrouter_catalog.record_limits(data.get("data", []))
     pricing = {}
     for m in data.get("data", []):
         p = m.get("pricing", {})
@@ -67,7 +69,13 @@ async def estimate_cost(
     user_query: str,
     council_models: List[Dict[str, str]],
     chairman_model: Dict[str, str],
-    web_search: bool = False
+    web_search: bool = False,
+    stage1_max_tokens: Optional[int] = None,
+    stage2_max_tokens: Optional[int] = None,
+    chairman_max_tokens: Optional[int] = None,
+    stage1_reasoning_effort: Optional[str] = None,
+    chairman_reasoning_effort: Optional[str] = None,
+    priced_for: Optional[str] = None,
 ) -> Dict:
     """
     Worst-case cost estimate for one council run, assuming every model uses
@@ -79,6 +87,22 @@ async def estimate_cost(
     pricing = await _get_openrouter_pricing()
     query_tokens = _estimate_tokens(user_query)
     num_seats = len(council_models)
+    s1_cap = stage1_max_tokens or DEFAULT_MAX_TOKENS
+    s2_cap = stage2_max_tokens or STAGE2_MAX_TOKENS
+    ch_cap = chairman_max_tokens or CHAIRMAN_MAX_TOKENS
+    seat_rows = []
+
+    def clamp(cap: int, model_id: Optional[str]) -> int:
+        return openrouter_catalog.clamp_max_tokens(cap, model_id)
+
+    # Each seat's real stage-1 cap is what the backend will send, so price that.
+    seat_s1 = {}
+    for seat in council_models:
+        m = _priced_model(seat)
+        if m:
+            seat_s1[id(seat)] = clamp(s1_cap, m)
+    s1_total = sum(clamp(s1_cap, _priced_model(seat)) for seat in council_models)
+    s2_cap_for = lambda m: clamp(s2_cap, m)
 
     breakdown = []
     total = 0.0
@@ -94,7 +118,12 @@ async def estimate_cost(
         model = _priced_model(seat)
         if not model:
             continue  # NVIDIA-only seat, no fallback path — guaranteed free
-        c = cost_for(model, query_tokens, DEFAULT_MAX_TOKENS)
+        seat_cap = seat_s1[id(seat)]
+        c = cost_for(model, query_tokens, seat_cap)
+        rates = pricing.get(model) or {"prompt": 0.0, "completion": 0.0}
+        seat_rows.append({"model": model, "input_cost_usd": round(rates["prompt"] * query_tokens, 6),
+                          "max_output_cost_usd": round(rates["completion"] * seat_cap, 6),
+                          "max_tokens_used": seat_cap})
         if c:
             breakdown.append({"stage": 1, "provider": "openrouter", "model": model, "cost_usd": round(c, 4)})
             total += c
@@ -107,21 +136,28 @@ async def estimate_cost(
 
     # Stage 2: each seat re-runs on a ranking prompt containing every stage1
     # response — worst case, every seat used its full stage1 budget.
-    stage2_input_estimate = query_tokens + num_seats * DEFAULT_MAX_TOKENS
+    stage2_input_estimate = query_tokens + s1_total
     for seat in council_models:
         model = _priced_model(seat)
         if not model:
             continue
-        c = cost_for(model, stage2_input_estimate, STAGE2_MAX_TOKENS)
+        c = cost_for(model, stage2_input_estimate, s2_cap_for(model))
         if c:
             breakdown.append({"stage": 2, "provider": "openrouter", "model": model, "cost_usd": round(c, 4)})
             total += c
 
     # Stage 3: Chairman sees every stage1 response + every stage2 ranking.
     chairman_priced_model = _priced_model(chairman_model)
+    chairman_row = None
     if chairman_priced_model:
-        stage3_input_estimate = query_tokens + 2 * num_seats * DEFAULT_MAX_TOKENS
-        c = cost_for(chairman_priced_model, stage3_input_estimate, CHAIRMAN_MAX_TOKENS)
+        stage3_input_estimate = query_tokens + 2 * s1_total
+        ch_used = clamp(ch_cap, chairman_priced_model)
+        c = cost_for(chairman_priced_model, stage3_input_estimate, ch_used)
+        crates = pricing.get(chairman_priced_model) or {"prompt": 0.0, "completion": 0.0}
+        chairman_row = {"model": chairman_priced_model,
+                        "input_cost_usd": round(crates["prompt"] * stage3_input_estimate, 6),
+                        "max_output_cost_usd": round(crates["completion"] * ch_used, 6),
+                        "max_tokens_used": ch_used}
         if c:
             breakdown.append({"stage": 3, "provider": "openrouter", "model": chairman_priced_model, "cost_usd": round(c, 4)})
             total += c
@@ -129,6 +165,12 @@ async def estimate_cost(
     return {
         "estimated_cost_usd": round(total, 4),
         "breakdown": breakdown,
+        "seats": seat_rows,
+        "chairman": chairman_row,
+        "includes_stage2": True,
+        "caps": {"stage1_max_tokens": s1_cap, "stage2_max_tokens": s2_cap, "chairman_max_tokens": ch_cap},
+        "reasoning": {"stage1": stage1_reasoning_effort, "chairman": chairman_reasoning_effort},
+        "priced_for": priced_for,
         "note": (
             "Upper-bound estimate: assumes every model uses its full max_tokens "
             "budget and ~4 chars/token. Seats with only an NVIDIA model (no "

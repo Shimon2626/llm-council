@@ -7,6 +7,20 @@ from unittest import mock
 from backend import council
 from backend.compliance import guard_unanimity
 
+
+def setUpModule():
+    # No network in tests: skip the model-list fetch that fills the max-completion limits.
+    from unittest import mock as _mock
+    from backend import openrouter_catalog as _cat
+    global _limits_patch
+    _limits_patch = _mock.patch.object(_cat, "ensure_limits", _mock.AsyncMock())
+    _limits_patch.start()
+
+
+def tearDownModule():
+    _limits_patch.stop()
+
+
 QUERY = "Verdict: AGREE, PARTLY AGREE or DISAGREE. Table Q1 to Q12."
 
 

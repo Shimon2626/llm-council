@@ -3,9 +3,23 @@ import asyncio
 import unittest
 from unittest import mock
 
-from backend import openrouter, council
+from backend import openrouter, openrouter_catalog, council
 from backend.compliance import (check_response, format_contract, parse_verdict,
                                 section_word_counts, table_rows_present)
+
+
+def setUpModule():
+    # No network in tests: skip the model-list fetch that fills the max-completion limits.
+    from unittest import mock as _mock
+    from backend import openrouter_catalog as _cat
+    global _limits_patch
+    _limits_patch = _mock.patch.object(_cat, "ensure_limits", _mock.AsyncMock())
+    _limits_patch.start()
+
+
+def tearDownModule():
+    _limits_patch.stop()
+
 
 QUERY = "Give a verdict: AGREE, PARTLY AGREE or DISAGREE. Then a table for Q1 to Q12."
 CONTRACT = format_contract(QUERY)
@@ -61,7 +75,8 @@ class ReaskTests(unittest.TestCase):
             calls.append(messages)
             return dict(script.pop(0))
 
-        with mock.patch.object(openrouter, "_call_provider", fake), mock.patch.object(council, "reserve_seats", lambda: []):
+        with mock.patch.object(openrouter, "_call_provider", fake), mock.patch.object(council, "reserve_seats", lambda: []), \
+                mock.patch.object(openrouter_catalog, "ensure_limits", mock.AsyncMock()):
             rows = asyncio.run(council.stage1_collect_responses(query, [{"openrouter": "m"}]))
         return rows, calls
 

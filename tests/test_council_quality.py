@@ -8,7 +8,21 @@ import asyncio
 import unittest
 from unittest import mock
 
-from backend import openrouter, council
+from backend import openrouter, openrouter_catalog, council
+
+
+def setUpModule():
+    # No network in tests: skip the model-list fetch that fills the max-completion limits.
+    from unittest import mock as _mock
+    from backend import openrouter_catalog as _cat
+    global _limits_patch
+    _limits_patch = _mock.patch.object(_cat, "ensure_limits", _mock.AsyncMock())
+    _limits_patch.start()
+
+
+def tearDownModule():
+    _limits_patch.stop()
+
 
 
 def reply(content, finish="stop", completion=100):
@@ -34,6 +48,11 @@ def run(coro):
 
 
 class QueryModelTests(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(openrouter_catalog, "ensure_limits", mock.AsyncMock())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_picked_free_slug_falls_back_to_paid(self):
         # both tiers share the openrouter key, so the fake is keyed by model
         # a network-style error is retried once on the same provider before failing over

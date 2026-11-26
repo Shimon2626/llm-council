@@ -8,7 +8,8 @@ import hashlib
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-_BLOCK_RE = re.compile(r"\*\*Attached file: ([^\n]*)\*\*\n```\n([\s\S]*?)\n```")
+PROMPT_FILE_MARK = " [PROMPT FILE]"
+_BLOCK_RE = re.compile(r"\*\*Attached file: ([^\n]*?)( \[PROMPT FILE\])?\*\*\n```\n([\s\S]*?)\n```")
 _NAME_RE = re.compile(r"^[\w][\w .()\-]*\.(?:docx|txt|xlsx|xls|pptx|zip|csv|md|pdf|json|png|jpe?g)$", re.I)
 _BYTES_RE = re.compile(r"^\d+$")
 _SHA_RE = re.compile(r"^[0-9a-f]{64}$", re.I)
@@ -23,7 +24,7 @@ def sha256_text(text: str) -> str:
 def split_query(content: str) -> Tuple[str, List[Dict[str, Any]]]:
     """(typed prompt, attachment blocks) from the message the UI builds."""
     typed = content.split("\n\n**Attached file:", 1)[0] if "**Attached file:" in content else content
-    blocks = [{"name": m.group(1), "text": m.group(2)} for m in _BLOCK_RE.finditer(content)]
+    blocks = [{"name": m.group(1), "text": m.group(3), "prompt_file": bool(m.group(2))} for m in _BLOCK_RE.finditer(content)]
     return typed, blocks
 
 
@@ -109,13 +110,35 @@ def missing_message(result: Dict[str, Any]) -> str:
     return f"The prompt's MANIFEST lists files that are not attached, so no seat was asked: {names}. Attach them and send again."
 
 
-def run_record(content: str, web_search: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def run_record(content: str, web_search: Optional[Dict[str, Any]] = None,
+               settings: Optional[Dict[str, Any]] = None,
+               attachment_meta: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """What the council was actually given, saved with the run: the full typed
-    prompt and, per attachment, its full extracted length and SHA-256 (the text
-    itself stays in the conversation's user message)."""
+    prompt, the effective token/reasoning settings and, per attachment, its full
+    extracted length, the extract cap and SHA-256 (the text itself stays in the
+    conversation's user message). cut_off comes from the extractor's own
+    `truncated` flag when the browser passed it in attachment_meta; otherwise it
+    falls back to the heuristic text_chars >= cap (cut_off_source says which)."""
     typed, blocks = split_query(content)
+    cap = (settings or {}).get("max_office_extract_chars")
+    meta = {m.get("name"): m for m in (attachment_meta or []) if isinstance(m, dict)}
+
+    def cut(b):
+        t = meta.get(b["name"], {}).get("truncated")
+        if isinstance(t, bool):
+            return t, "extractor"
+        return ((len(b["text"]) >= cap) if cap else None), "heuristic"
+
+    attachments = []
+    for b in blocks:
+        cut_off, source = cut(b)
+        attachments.append({
+            "name": b["name"], "text_chars": len(b["text"]), "text_sha256": sha256_text(b["text"]),
+            "cap": cap, "cut_off": cut_off, "cut_off_source": source, "prompt_file": b["prompt_file"],
+        })
     return {
         "web_search": web_search,
         "typed_prompt": typed.strip(),
-        "attachments": [{"name": b["name"], "text_chars": len(b["text"]), "text_sha256": sha256_text(b["text"])} for b in blocks],
+        "settings": settings,
+        "attachments": attachments,
     }

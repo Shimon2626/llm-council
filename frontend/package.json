@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
-    "test": "node --test tests/reportText.test.js tests/persistedState.test.js",
+    "test": "node --test tests/reportText.test.js tests/persistedState.test.js tests/runSettings.test.js tests/estimate.test.js",
     "preview": "vite preview"
   },
   "dependencies": {

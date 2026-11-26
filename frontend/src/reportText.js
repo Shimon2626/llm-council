@@ -1,7 +1,7 @@
 // Pure text builders for the markdown report (no React), so they can be tested
 // with `node --test frontend/tests`.
 
-const ATTACHED_BLOCK = /\*\*Attached file: ([^\n]*)\*\*\n```\n([\s\S]*?)\n```/g;
+const ATTACHED_BLOCK = /\*\*Attached file: ([^\n]*?)( \[PROMPT FILE\])?\*\*\n```\n([\s\S]*?)\n```/g;
 
 export const typedPrompt = (query) => (query || '').split('\n\n**Attached file:')[0].trim();
 
@@ -17,28 +17,56 @@ const previewBlock = (name, body, n) => {
 };
 
 export const previewAttachments = (query, n = 600) =>
-  (query || '').replace(ATTACHED_BLOCK, (_, name, body) => previewBlock(name, body, n));
+  (query || '').replace(ATTACHED_BLOCK, (_, name, mark, body) => previewBlock(name + (mark || ''), body, n));
 
 // Only the attachment previews, without the typed prompt.
 export const attachmentPreviewBlocks = (query, n = 600) =>
-  [...(query || '').matchAll(ATTACHED_BLOCK)].map((m) => previewBlock(m[1], m[2], n)).join('\n\n');
+  [...(query || '').matchAll(ATTACHED_BLOCK)].map((m) => previewBlock(m[1] + (m[2] || ''), m[3], n)).join('\n\n');
 
 const cell = (v) => String(v ?? '').replace(/\|/g, '\\|').replace(/\n/g, ' ');
 
 export const attachmentTable = (runRecord) => {
   const rows = runRecord?.attachments || [];
   if (rows.length === 0) return ['_no attachments_', ''];
+  const cutText = (a) => (a.cut_off === true ? 'CUT OFF yes' : a.cut_off === false ? 'CUT OFF no' : 'CUT OFF not recorded');
   return [
     '| File | Full extracted length (chars) | SHA-256 of full extracted text |',
     '|---|---|---|',
-    ...rows.map((a) => `| ${cell(a.name)} | ${a.text_chars} | ${a.text_sha256} |`),
+    ...rows.map((a) => `| ${cell(a.name)}${a.prompt_file ? ' (PROMPT FILE)' : ''} | ${a.text_chars} | ${a.text_sha256} |`),
+    '',
+    'Extracted chars per attachment:',
+    ...rows.map((a) => `- ${a.name}${a.prompt_file ? ' [PROMPT FILE]' : ''}, ${a.text_chars} chars, cap ${a.cap ?? 'not recorded'}, ${cutText(a)}${a.cut_off_source === 'extractor' ? ' (extractor flag)' : a.cut_off != null ? ' (length heuristic)' : ''}`),
     '',
   ];
 };
 
+const SETTING_LABELS = [
+  ['stage1_max_tokens', 'Stage 1 max tokens per seat'],
+  ['retry_max_tokens_ceiling', 'Retry ceiling (tokens)'],
+  ['stage1_reasoning_effort', 'Stage 1 reasoning effort'],
+  ['chairman_reasoning_effort', 'Chairman reasoning effort'],
+  ['stage2_max_tokens', 'Stage 2 max tokens per reviewer'],
+  ['chairman_max_tokens', 'Chairman max tokens'],
+  ['max_office_extract_chars', 'Max extracted chars per attachment'],
+];
+
+export const settingsTable = (runRecord) => {
+  const st = runRecord?.settings;
+  if (!st) return ['_not recorded for this conversation_', ''];
+  const show = (k, v) => (k.endsWith('_reasoning_effort') ? (v === '' || v == null ? 'default (none sent)' : v) : v);
+  const rows = [
+    '| Setting | Value used |',
+    '|---|---|',
+    ...SETTING_LABELS.map(([k, label]) => `| ${label} | ${cell(show(k, st[k]))} |`),
+  ];
+  if (st.clamped && st.clamped.length) rows.push('', `Clamped to limits: ${st.clamped.join('; ')}`);
+  rows.push('');
+  return rows;
+};
+
 const statusOf = (r) => r.status || 'ok';
 
-export const healthLines = (s1) => {
+export const healthLines = (s1, s2 = [], s3 = null) => {
   const asked = s1.filter((r) => statusOf(r) !== 'duplicate');
   const ok = asked.filter((r) => statusOf(r) === 'ok').length;
   const cut = asked.filter((r) => statusOf(r) === 'truncated').length;
@@ -56,15 +84,28 @@ export const healthLines = (s1) => {
       lines.push(`- NON-COMPLIANT: ${r.model}: ${r.compliance.issues.join('; ')}${r.compliance.reasked ? ' (re-asked once)' : ''}.`);
     }
   });
+  const cut2 = (s2 || []).filter((r) => r.truncated || r.finish_reason === 'length');
+  if (cut2.length) {
+    lines.push(`- STAGE 2 CUT OFF: ${cut2.length} of ${s2.length} reviewer rankings hit the token cap (finish_reason=length): ${cut2.map((r) => r.model).join(', ')}. Those rankings may be incomplete.`);
+  }
+  if (s3 && (s3.status === 'truncated' || s3.finish_reason === 'length')) {
+    lines.push(`- STAGE 3 CUT OFF: ${s3.model}. Chairman output was cut off; the merged table is incomplete.`);
+  }
   return lines;
 };
 
+export const reasoningShare = (r) => {
+  const c = Number(r?.completion_tokens) || 0;
+  if (c <= 0) return 'n/a';
+  return `${(((Number(r?.reasoning_tokens) || 0) / c) * 100).toFixed(1)}%`;
+};
+
 export const seatTable = (s1) => [
-  '| Seat | Answered by | Status | finish_reason | Prompt tok | Completion tok | Reasoning tok | Seconds | Attempts |',
-  '|---|---|---|---|---|---|---|---|---|',
+  '| Seat | Answered by | Status | finish_reason | Prompt tok | Completion tok | Reasoning tok | Reasoning share | Seconds | Attempts |',
+  '|---|---|---|---|---|---|---|---|---|---|',
   ...s1.map((r) =>
     `| ${cell(r.seat || r.model)} | ${cell(r.model)} | ${statusOf(r)} | ${r.finish_reason ?? 'null'} | ` +
-    `${r.prompt_tokens ?? '?'} | ${r.completion_tokens ?? 0} | ${r.reasoning_tokens ?? 0} | ${r.duration_s ?? '?'} | ${r.attempts ?? '?'} |`),
+    `${r.prompt_tokens ?? '?'} | ${r.completion_tokens ?? 0} | ${r.reasoning_tokens ?? 0} | ${reasoningShare(r)} | ${r.duration_s ?? '?'} | ${r.attempts ?? '?'} |`),
   '',
 ];
 

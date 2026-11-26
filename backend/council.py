@@ -17,7 +17,9 @@ from .compliance import format_contract, check_response, parse_verdict, verdict_
 UNREADABLE_ATTACHMENT_RULE = (
     "If any attachment or part of the query is unreadable, garbled or appears "
     "to be binary data, say so plainly and mark what you cannot judge. Never "
-    "infer, reconstruct or invent the contents of something you cannot read."
+    "infer, reconstruct or invent the contents of something you cannot read. "
+    "An attachment whose header ends with [PROMPT FILE] holds the instructions "
+    "for this task: follow it, and treat the other attachments as evidence."
 )
 
 def _seat_label(spec) -> str:
@@ -73,7 +75,8 @@ REASK_PART_TEXT = {
 }
 
 
-async def _enforce_format(rows, messages, specs_by_label, contract, max_tokens, cost_log):
+async def _enforce_format(rows, messages, specs_by_label, contract, max_tokens, cost_log,
+                          reasoning_effort=STAGE1_REASONING_EFFORT, retry_ceiling=None):
     """Check each complete seat against the prompt's format; re-ask once, for
     the missing part only, when the verdict line or the Q-table is absent.
     Every checked row gets row["compliance"]; over-long answers are only marked.
@@ -92,7 +95,7 @@ async def _enforce_format(rows, messages, specs_by_label, contract, max_tokens, 
                                             "with no other text and no repeat of the rest."},
             ]
             reply = await query_model(spec, followup, max_tokens=max_tokens or DEFAULT_MAX_TOKENS,
-                                      reasoning_effort=STAGE1_REASONING_EFFORT)
+                                      reasoning_effort=reasoning_effort, retry_ceiling=retry_ceiling)
             compliance["reasked"] = True
             if reply is not None and not is_empty(reply):
                 extra = (reply.get("content") or "").strip()
@@ -122,7 +125,9 @@ async def stage1_collect_responses(
     council_max_tokens: Optional[int] = None,
     cost_log: Optional[List[Dict[str, Any]]] = None,
     web_search: bool = False,
-    progress: Optional[Dict[str, int]] = None
+    progress: Optional[Dict[str, int]] = None,
+    reasoning_effort: str = STAGE1_REASONING_EFFORT,
+    retry_ceiling: Optional[int] = None
 ) -> List[Dict[str, Any]]:
     """
     Stage 1: Collect individual responses from all council models.
@@ -173,8 +178,8 @@ async def stage1_collect_responses(
         error_logs: Dict[str, List[Dict[str, Any]]] = {}
         responses = await query_models_parallel(
             to_ask, messages, max_tokens=council_max_tokens,
-            reasoning_effort=STAGE1_REASONING_EFFORT, web_search=web_search, error_logs=error_logs,
-            progress=progress)
+            reasoning_effort=reasoning_effort, web_search=web_search, error_logs=error_logs,
+            progress=progress, retry_ceiling=retry_ceiling)
         failed_labels = []
         for label, response in responses.items():
             row = _seat_row(label, response, error_logs.get(label, []))
@@ -202,7 +207,8 @@ async def stage1_collect_responses(
     contract = format_contract(user_query)
     if contract:
         specs_by_label = {_seat_label(s): s for s in seats + reserve_seats()}
-        await _enforce_format(rows, messages, specs_by_label, contract, council_max_tokens, cost_log)
+        await _enforce_format(rows, messages, specs_by_label, contract, council_max_tokens, cost_log,
+                              reasoning_effort, retry_ceiling)
 
     return rows
 
@@ -228,7 +234,9 @@ async def stage2_collect_rankings(
     council_models: Optional[List[Dict[str, str]]] = None,
     council_max_tokens: Optional[int] = None,
     cost_log: Optional[List[Dict[str, Any]]] = None,
-    progress: Optional[Dict[str, int]] = None
+    progress: Optional[Dict[str, int]] = None,
+    stage2_max_tokens: Optional[int] = None,
+    retry_ceiling: Optional[int] = None
 ) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
     """
     Stage 2: Each model ranks the anonymized responses.
@@ -304,8 +312,11 @@ Now provide your evaluation and ranking:"""
     # Get rankings from all council models in parallel (same fallback backfill as stage 1)
     effective_models = enrich_council_models(council_models) if council_models else COUNCIL_MODELS
     voters = _voter_specs(effective_models, all_stage1)
-    responses = await query_models_parallel(voters, messages, max_tokens=council_max_tokens if council_max_tokens is not None else STAGE2_MAX_TOKENS,
-        reasoning_effort=STAGE2_REASONING_EFFORT, progress=progress)
+    # The per-run stage 2 cap wins; else the older shared override; else the env default.
+    stage2_cap = (stage2_max_tokens if stage2_max_tokens is not None
+                  else council_max_tokens if council_max_tokens is not None else STAGE2_MAX_TOKENS)
+    responses = await query_models_parallel(voters, messages, max_tokens=stage2_cap,
+        reasoning_effort=STAGE2_REASONING_EFFORT, progress=progress, retry_ceiling=retry_ceiling)
     label_by_seat = {r.get("seat"): lab for lab, r in zip(labels, stage1_results) if r.get("seat")}
 
     # Format results
@@ -321,7 +332,12 @@ Now provide your evaluation and ranking:"""
                 # the aggregate can leave out a seat's vote for itself.
                 "self_label": f"Response {label_by_seat[seat_label]}" if seat_label in label_by_seat else None,
                 "ranking": full_text,
-                "parsed_ranking": parsed
+                "parsed_ranking": parsed,
+                "finish_reason": response.get('finish_reason'),
+                "truncated": bool(response.get('truncated')),
+                "max_tokens_used": response.get('max_tokens_used'),
+                "completion_tokens": (response.get('usage') or {}).get('completion_tokens', 0),
+                "reasoning_tokens": (response.get('usage') or {}).get('reasoning_tokens', 0),
             })
             if cost_log is not None:
                 usage = response.get('usage') or {}
@@ -377,7 +393,9 @@ async def stage3_synthesize_final(
     chairman_model: Optional[Dict[str, str]] = None,
     chairman_max_tokens: Optional[int] = None,
     cost_log: Optional[List[Dict[str, Any]]] = None,
-    web_search: bool = False
+    web_search: bool = False,
+    retry_ceiling: Optional[int] = None,
+    reasoning_effort: str = CHAIRMAN_REASONING_EFFORT
 ) -> Dict[str, Any]:
     """
     Stage 3: Chairman synthesizes final response.
@@ -454,7 +472,8 @@ Provide a clear, well-reasoned final answer that represents the council's collec
     # chairman pick still fails over to its verified equivalent on error.
     effective_chairman_max_tokens = chairman_max_tokens if chairman_max_tokens is not None else CHAIRMAN_MAX_TOKENS
     effective_chairman = enrich_model_spec(chairman_model) if chairman_model else CHAIRMAN_MODEL
-    response = await query_model(effective_chairman, messages, max_tokens=effective_chairman_max_tokens, reasoning_effort=CHAIRMAN_REASONING_EFFORT)
+    response = await query_model(effective_chairman, messages, max_tokens=effective_chairman_max_tokens,
+                                 reasoning_effort=reasoning_effort, retry_ceiling=retry_ceiling)
 
     if response is None or is_empty(response):
         # Fallback if chairman fails (error OR blank reply)
@@ -477,6 +496,9 @@ Provide a clear, well-reasoned final answer that represents the council's collec
         "response": guard_unanimity(response.get('content') or '', tally, n_ok),
         "status": "empty" if response.get('empty') else "truncated" if response.get('truncated') else "ok",
         "finish_reason": response.get('finish_reason'),
+        "max_tokens_used": response.get('max_tokens_used'),
+        "completion_tokens": (response.get('usage') or {}).get('completion_tokens', 0),
+        "reasoning_tokens": (response.get('usage') or {}).get('reasoning_tokens', 0),
     }
 
 
@@ -614,7 +636,11 @@ async def run_full_council(
     chairman_model: Optional[Dict[str, str]] = None,
     council_max_tokens: Optional[int] = None,
     chairman_max_tokens: Optional[int] = None,
-    web_search: bool = False
+    web_search: bool = False,
+    stage2_max_tokens: Optional[int] = None,
+    retry_ceiling: Optional[int] = None,
+    stage1_reasoning_effort: str = STAGE1_REASONING_EFFORT,
+    chairman_reasoning_effort: str = CHAIRMAN_REASONING_EFFORT
 ) -> Tuple[List, List, Dict, Dict]:
     """
     Run the complete 3-stage council process.
@@ -634,7 +660,9 @@ async def run_full_council(
     cost_log = []
 
     # Stage 1: Collect individual responses
-    stage1_results = await stage1_collect_responses(user_query, council_models, council_max_tokens, cost_log, web_search)
+    stage1_results = await stage1_collect_responses(
+        user_query, council_models, council_max_tokens, cost_log, web_search,
+        reasoning_effort=stage1_reasoning_effort, retry_ceiling=retry_ceiling)
 
     # If no models responded successfully, return error
     if not any(r.get("status", "ok") in ("ok", "truncated") for r in stage1_results):
@@ -644,7 +672,9 @@ async def run_full_council(
         }, {}
 
     # Stage 2: Collect rankings
-    stage2_results, label_to_model = await stage2_collect_rankings(user_query, stage1_results, council_models, council_max_tokens, cost_log)
+    stage2_results, label_to_model = await stage2_collect_rankings(
+        user_query, stage1_results, council_models, council_max_tokens, cost_log,
+        stage2_max_tokens=stage2_max_tokens, retry_ceiling=retry_ceiling)
 
     # Calculate aggregate rankings
     aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
@@ -657,7 +687,9 @@ async def run_full_council(
         chairman_model,
         chairman_max_tokens,
         cost_log,
-        web_search
+        web_search,
+        retry_ceiling=retry_ceiling,
+        reasoning_effort=chairman_reasoning_effort
     )
 
     # Prepare metadata
