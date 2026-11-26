@@ -11,6 +11,20 @@ import httpx
 from backend import openrouter, council, config
 
 
+def setUpModule():
+    # No network in tests: skip the model-list fetch that fills the max-completion limits.
+    from unittest import mock as _mock
+    from backend import openrouter_catalog as _cat
+    global _limits_patch
+    _limits_patch = _mock.patch.object(_cat, "ensure_limits", _mock.AsyncMock())
+    _limits_patch.start()
+
+
+def tearDownModule():
+    _limits_patch.stop()
+
+
+
 def reply(content, finish="stop"):
     return {"content": content, "reasoning_details": None, "finish_reason": finish,
             "usage": {"prompt_tokens": 10, "completion_tokens": 5, "reasoning_tokens": 0}}

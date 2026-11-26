@@ -9,6 +9,20 @@ from backend import openrouter, council
 from backend.preflight import run_record
 
 
+def setUpModule():
+    # No network in tests: skip the model-list fetch that fills the max-completion limits.
+    from unittest import mock as _mock
+    from backend import openrouter_catalog as _cat
+    global _limits_patch
+    _limits_patch = _mock.patch.object(_cat, "ensure_limits", _mock.AsyncMock())
+    _limits_patch.start()
+
+
+def tearDownModule():
+    _limits_patch.stop()
+
+
+
 class RunRecordTests(unittest.TestCase):
     def test_full_typed_prompt_and_attachment_hashes_are_kept(self):
         typed = "Review the plan. " * 100  # well past any preview length

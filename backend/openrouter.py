@@ -10,6 +10,7 @@ import time
 import httpx
 from typing import List, Dict, Any, Optional, Union
 from .config import PROVIDERS
+from . import openrouter_catalog
 from .web_search import WEB_MAX_RESULTS
 
 ModelSpec = Union[str, Dict[str, str]]
@@ -211,6 +212,7 @@ async def query_model(
     model_spec = _with_paid_fallback(model_spec)
 
     ceiling = RETRY_MAX_TOKENS_CEILING if retry_ceiling is None else retry_ceiling
+    await openrouter_catalog.ensure_limits()
     soft_failure = None  # an answer that arrived but was empty/cut off
     spent = {'prompt_tokens': 0, 'completion_tokens': 0, 'reasoning_tokens': 0}  # billed across retries
     for provider in PROVIDER_ORDER:
@@ -220,7 +222,8 @@ async def query_model(
         if web_search and provider == "nvidia":
             continue  # NVIDIA has no search; the seat's OpenRouter entry answers instead
         effective_timeout = timeout if timeout is not None else PROVIDER_TIMEOUTS[provider]
-        cap = max_tokens
+        limit_ids = (model, model_spec.get("openrouter"))
+        cap = openrouter_catalog.clamp_max_tokens(max_tokens, *limit_ids)
         for attempt in (1, 2):
             started = time.monotonic()
             try:
@@ -251,7 +254,7 @@ async def query_model(
                   f"(finish_reason={result.get('finish_reason')}, cap={cap}, attempt={attempt})")
             if soft_failure is None or (soft_failure['empty'] and not result['empty']):
                 soft_failure = result
-            bigger = min(cap * 2, ceiling)
+            bigger = openrouter_catalog.clamp_max_tokens(min(cap * 2, ceiling), *limit_ids)
             if attempt == 1 and result.get('finish_reason') == 'length' and bigger > cap:
                 cap = bigger  # one retry with more room
                 continue
